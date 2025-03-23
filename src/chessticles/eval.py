@@ -136,48 +136,48 @@ class ChessAnalyzer:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
-        # Create a temporary view with game type calculation
-        cursor.execute("""
-        CREATE TEMPORARY VIEW IF NOT EXISTS game_with_type AS
-        SELECT 
-            g.*,
-            CASE 
-                WHEN g.TimeControl LIKE '%+%' THEN 
-                    CAST(SUBSTR(g.TimeControl, 1, INSTR(g.TimeControl, '+')-1) AS INTEGER) + 
-                    (40 * CAST(SUBSTR(g.TimeControl, INSTR(g.TimeControl, '+')+1) AS INTEGER))
-                WHEN g.TimeControl IS NOT NULL AND g.TimeControl != '-' THEN
-                    CAST(g.TimeControl AS INTEGER)
-                ELSE NULL
-            END AS estimated_time,
-            CASE 
-                WHEN (CASE 
-                        WHEN g.TimeControl LIKE '%+%' THEN 
-                            CAST(SUBSTR(g.TimeControl, 1, INSTR(g.TimeControl, '+')-1) AS INTEGER) + 
-                            (40 * CAST(SUBSTR(g.TimeControl, INSTR(g.TimeControl, '+')+1) AS INTEGER))
-                        WHEN g.TimeControl IS NOT NULL AND g.TimeControl != '-' THEN
-                            CAST(g.TimeControl AS INTEGER)
-                        ELSE NULL
-                      END) <= 179 THEN 'bullet'
-                WHEN (CASE 
-                        WHEN g.TimeControl LIKE '%+%' THEN 
-                            CAST(SUBSTR(g.TimeControl, 1, INSTR(g.TimeControl, '+')-1) AS INTEGER) + 
-                            (40 * CAST(SUBSTR(g.TimeControl, INSTR(g.TimeControl, '+')+1) AS INTEGER))
-                        WHEN g.TimeControl IS NOT NULL AND g.TimeControl != '-' THEN
-                            CAST(g.TimeControl AS INTEGER)
-                        ELSE NULL
-                      END) <= 479 THEN 'blitz'
-                WHEN (CASE 
-                        WHEN g.TimeControl LIKE '%+%' THEN 
-                            CAST(SUBSTR(g.TimeControl, 1, INSTR(g.TimeControl, '+')-1) AS INTEGER) + 
-                            (40 * CAST(SUBSTR(g.TimeControl, INSTR(g.TimeControl, '+')+1) AS INTEGER))
-                        WHEN g.TimeControl IS NOT NULL AND g.TimeControl != '-' THEN
-                            CAST(g.TimeControl AS INTEGER)
-                        ELSE NULL
-                      END) <= 1499 THEN 'rapid'
-                ELSE 'classical'
-            END AS game_type
-        FROM games g
-        """)
+        # # Create a temporary view with game type calculation
+        # cursor.execute("""
+        # CREATE TEMPORARY VIEW IF NOT EXISTS game_with_type AS
+        # SELECT
+        #     g.*,
+        #     CASE
+        #         WHEN g.TimeControl LIKE '%+%' THEN
+        #             CAST(SUBSTR(g.TimeControl, 1, INSTR(g.TimeControl, '+')-1) AS INTEGER) +
+        #             (40 * CAST(SUBSTR(g.TimeControl, INSTR(g.TimeControl, '+')+1) AS INTEGER))
+        #         WHEN g.TimeControl IS NOT NULL AND g.TimeControl != '-' THEN
+        #             CAST(g.TimeControl AS INTEGER)
+        #         ELSE NULL
+        #     END AS estimated_time,
+        #     CASE
+        #         WHEN (CASE
+        #                 WHEN g.TimeControl LIKE '%+%' THEN
+        #                     CAST(SUBSTR(g.TimeControl, 1, INSTR(g.TimeControl, '+')-1) AS INTEGER) +
+        #                     (40 * CAST(SUBSTR(g.TimeControl, INSTR(g.TimeControl, '+')+1) AS INTEGER))
+        #                 WHEN g.TimeControl IS NOT NULL AND g.TimeControl != '-' THEN
+        #                     CAST(g.TimeControl AS INTEGER)
+        #                 ELSE NULL
+        #               END) <= 179 THEN 'bullet'
+        #         WHEN (CASE
+        #                 WHEN g.TimeControl LIKE '%+%' THEN
+        #                     CAST(SUBSTR(g.TimeControl, 1, INSTR(g.TimeControl, '+')-1) AS INTEGER) +
+        #                     (40 * CAST(SUBSTR(g.TimeControl, INSTR(g.TimeControl, '+')+1) AS INTEGER))
+        #                 WHEN g.TimeControl IS NOT NULL AND g.TimeControl != '-' THEN
+        #                     CAST(g.TimeControl AS INTEGER)
+        #                 ELSE NULL
+        #               END) <= 479 THEN 'blitz'
+        #         WHEN (CASE
+        #                 WHEN g.TimeControl LIKE '%+%' THEN
+        #                     CAST(SUBSTR(g.TimeControl, 1, INSTR(g.TimeControl, '+')-1) AS INTEGER) +
+        #                     (40 * CAST(SUBSTR(g.TimeControl, INSTR(g.TimeControl, '+')+1) AS INTEGER))
+        #                 WHEN g.TimeControl IS NOT NULL AND g.TimeControl != '-' THEN
+        #                     CAST(g.TimeControl AS INTEGER)
+        #                 ELSE NULL
+        #               END) <= 1499 THEN 'rapid'
+        #         ELSE 'classical'
+        #     END AS game_type
+        # FROM games g
+        # """)
 
         # Query for games that don't have analysis, filtered by game type
         query = """
@@ -282,6 +282,14 @@ class ChessAnalyzer:
                 return {
                     "game_id": game_id,
                     "error": "Failed to parse PGN",
+                    "time_control": time_control,
+                    "estimated_time": estimated_time,
+                    "game_type": game_type,
+                }
+            if sum(1 for _ in game.mainline_moves()) < 5:
+                return {
+                    "game_id": game_id,
+                    "error": "Game too short",
                     "time_control": time_control,
                     "estimated_time": estimated_time,
                     "game_type": game_type,
@@ -469,15 +477,17 @@ class ChessAnalyzer:
         Args:
             analysis_results (dict): Analysis results
         """
-        if "error" in analysis_results:
-            print(f"Error for game {analysis_results['game_id']}: {analysis_results['error']}")
-            return False
-
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
+        for index, analysis_result in enumerate(analysis_results):
+            if "error" in analysis_result:
+                # print(f"Error for game {analysis_result['game_id']}: {analysis_result['error']}")
+                # return False
+                analysis_results.pop(index)
+
         try:
-            cursor.execute(
+            cursor.executemany(
                 """
             INSERT INTO game_analysis
             (game_id, white_acl, black_acl, 
@@ -486,31 +496,34 @@ class ChessAnalyzer:
              time_eval_data, time_control, estimated_time, game_type)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-                (
-                    analysis_results["game_id"],
-                    analysis_results["white_acl"],
-                    analysis_results["black_acl"],
-                    analysis_results["white_blunders"],
-                    analysis_results["white_mistakes"],
-                    analysis_results["white_inaccuracies"],
-                    analysis_results["black_blunders"],
-                    analysis_results["black_mistakes"],
-                    analysis_results["black_inaccuracies"],
-                    analysis_results["time_eval_data"],
-                    analysis_results["time_control"],
-                    analysis_results["estimated_time"],
-                    analysis_results["game_type"],
-                ),
+                [
+                    (
+                        analysis_result["game_id"],
+                        analysis_result["white_acl"],
+                        analysis_result["black_acl"],
+                        analysis_result["white_blunders"],
+                        analysis_result["white_mistakes"],
+                        analysis_result["white_inaccuracies"],
+                        analysis_result["black_blunders"],
+                        analysis_result["black_mistakes"],
+                        analysis_result["black_inaccuracies"],
+                        analysis_result["time_eval_data"],
+                        analysis_result["time_control"],
+                        analysis_result["estimated_time"],
+                        analysis_result["game_type"],
+                    )
+                    for analysis_result in analysis_results
+                ],
             )
 
             conn.commit()
             conn.close()
-            return True
-
         except Exception as e:
             conn.close()
             print(f"Error saving analysis for game {analysis_results['game_id']}: {e}")
             return False
+        else:
+            return True
 
     def run_analysis(self, batch_size=100, total_games=None, game_type_filter="rapid"):
         """Run analysis on unanalyzed games in parallel.
@@ -553,11 +566,12 @@ class ChessAnalyzer:
                         if "error" not in result:
                             # self.save_analysis(result)
                             games_processed += 1
-                        results.append(result)
+                            results.append(result)
                     except Exception as e:
                         print(f"Error processing game {game[0]}: {e}")
 
             # Print summary for this batch
+            self.save_analysis(results)
             success = sum(1 for r in results if "error" not in r)
             error = sum(1 for r in results if "error" in r)
             print(f"Batch completed: {success} successful, {error} errors")
@@ -774,7 +788,7 @@ if __name__ == "__main__":
     )
 
     # Run analysis
-    analyzer.run_analysis(batch_size=50, total_games=1000)
+    analyzer.run_analysis(batch_size=50, total_games=100000)
 
     # Generate visualizations
     analyzer.visualize_results(limit=100)
