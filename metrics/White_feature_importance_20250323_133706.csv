@@ -1,0 +1,14 @@
+Feature,Importance
+max_eval_advantage_white,0.12465028261319311
+white_blunders,0.10436127225928155
+white_eval_volatility,0.1027130301626315
+white_inaccuracies,0.08728131555025685
+white_time_pressure_moves,0.08109602101449441
+white_time_usage,0.07936065716778251
+white_mistakes,0.07810823094258407
+estimated_time,0.07728090478146757
+position_complexity,0.076152422675424
+white_avg_time_per_move,0.07292179819192375
+white_acl,0.06058351019270271
+black_acl,0.0554905544482579
+game_type_encoded,1.01729796e-316

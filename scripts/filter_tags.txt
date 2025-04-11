@@ -1,0 +1,3 @@
+TimeControl "600+0"
+Termination "Normal"
+Termination "Time forfeit"

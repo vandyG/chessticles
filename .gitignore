@@ -25,3 +25,5 @@ uv.lock
 __pycache__/
 
 .envrc
+
+data/

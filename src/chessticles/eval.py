@@ -1,4 +1,5 @@
 import concurrent.futures
+import contextlib
 import io
 import json
 import os
@@ -12,7 +13,6 @@ import chess.pgn
 import matplotlib.pyplot as plt
 import pandas as pd
 from tqdm import tqdm
-import contextlib
 
 
 class ChessAnalyzer:
@@ -123,7 +123,7 @@ class ChessAnalyzer:
             return "rapid"
         return "classical"
 
-    def get_games_to_analyze(self, limit=None, game_type_filter="rapid"):
+    def get_games_to_analyze(self, limit=None, game_type_filter="rapid", offset=0):
         """Get games that haven't been analyzed yet, filtered by game type.
 
         Args:
@@ -190,8 +190,16 @@ class ChessAnalyzer:
         if game_type_filter:
             query += f" AND g.game_type = '{game_type_filter}' AND (g.MOVES != '1-0\n' AND g.MOVES != '0-1\n')"
 
+        # Add ORDER BY to ensure consistent results when using offset
+        query += " ORDER BY g.ID"
+
+        # Apply limit if specified
         if limit:
             query += f" LIMIT {limit}"
+
+        # Apply offset for resuming analysis
+        if offset > 0:
+            query += f" OFFSET {offset}"
 
         cursor.execute(query)
         games = cursor.fetchall()
@@ -525,22 +533,28 @@ class ChessAnalyzer:
         else:
             return True
 
-    def run_analysis(self, batch_size=100, total_games=None, game_type_filter="rapid"):
+    def run_analysis(self, batch_size=100, total_games=None, game_type_filter="rapid", start_offset=0):
         """Run analysis on unanalyzed games in parallel.
 
         Args:
             batch_size (int): Number of games to process in each batch
             total_games (int, optional): Total number of games to process
             game_type_filter (str): Type of games to analyze (rapid, blitz, classical, etc.)
+            start_offset (int, optional): Initial offset for resuming a previous analysis run
         """
         games_processed = 0
+        current_offset = start_offset
 
-        print(f"Starting analysis of {game_type_filter} games...")
+        print(f"Starting analysis of {game_type_filter} games with offset {start_offset}...")
 
         # Process games in batches
         while True:
-            # Get a batch of games to analyze
-            games = self.get_games_to_analyze(limit=batch_size, game_type_filter=game_type_filter)
+            # Get a batch of games to analyze with current offset
+            games = self.get_games_to_analyze(
+                limit=batch_size,
+                game_type_filter=game_type_filter,
+                offset=current_offset,
+            )
 
             if not games:
                 print(f"No more {game_type_filter} games to analyze")
@@ -550,7 +564,7 @@ class ChessAnalyzer:
                 print(f"Reached target of {total_games} games")
                 break
 
-            print(f"Processing batch of {len(games)} {game_type_filter} games...")
+            print(f"Processing batch of {len(games)} {game_type_filter} games (offset: {current_offset})...")
 
             # Process games in parallel
             results = []
@@ -576,6 +590,11 @@ class ChessAnalyzer:
             error = sum(1 for r in results if "error" in r)
             print(f"Batch completed: {success} successful, {error} errors")
             print(f"Total {game_type_filter} games processed so far: {games_processed}")
+
+            # Update the offset for the next batch
+            # We need to increase by the batch size, not just the number of successful analyses,
+            # because we want to skip all games we've already attempted, even errors
+            current_offset += len(games)
 
             if total_games and games_processed >= total_games:
                 print(f"Reached target of {total_games} {game_type_filter} games")

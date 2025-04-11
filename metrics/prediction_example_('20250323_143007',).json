@@ -1,0 +1,31 @@
+{
+    "timestamp": [
+        "20250323_143007"
+    ],
+    "game_data": {
+        "white_acl": 120.5,
+        "black_acl": 118.2,
+        "white_blunders": 3,
+        "white_mistakes": 5,
+        "white_inaccuracies": 7,
+        "black_blunders": 4,
+        "black_mistakes": 6,
+        "black_inaccuracies": 8,
+        "position_complexity": 45.3,
+        "white_time_usage": 250.5,
+        "black_time_usage": 275.2,
+        "white_eval_volatility": 120.7,
+        "black_eval_volatility": 135.2,
+        "white_avg_time_per_move": 12.5,
+        "black_avg_time_per_move": 13.8,
+        "white_time_pressure_moves": 5,
+        "black_time_pressure_moves": 6,
+        "max_eval_advantage_white": 250,
+        "max_eval_advantage_black": 150,
+        "game_type_encoded": 1,
+        "estimated_time": 600,
+        "opponent_elo": 1800
+    },
+    "white_predicted_elo": 1985.1842235455324,
+    "black_predicted_elo": 1673.3288674354371
+}

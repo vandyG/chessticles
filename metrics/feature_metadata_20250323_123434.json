@@ -1,0 +1,38 @@
+{
+    "white_features": [
+        "white_acl",
+        "black_acl",
+        "position_complexity",
+        "game_type_encoded",
+        "estimated_time",
+        "white_blunders",
+        "white_mistakes",
+        "white_inaccuracies",
+        "white_time_usage",
+        "white_eval_volatility",
+        "white_avg_time_per_move",
+        "white_time_pressure_moves",
+        "max_eval_advantage_white",
+        "opponent_elo"
+    ],
+    "black_features": [
+        "white_acl",
+        "black_acl",
+        "position_complexity",
+        "game_type_encoded",
+        "estimated_time",
+        "black_blunders",
+        "black_mistakes",
+        "black_inaccuracies",
+        "black_time_usage",
+        "black_eval_volatility",
+        "black_avg_time_per_move",
+        "black_time_pressure_moves",
+        "max_eval_advantage_black",
+        "opponent_elo"
+    ],
+    "game_type_mapping": {
+        "rapid": 0
+    },
+    "timestamp": "20250323_123434"
+}

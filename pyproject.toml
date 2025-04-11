@@ -29,7 +29,16 @@ classifiers = [
     "Topic :: Utilities",
     "Typing :: Typed",
 ]
-dependencies = []
+dependencies = [
+    "cairosvg>=2.7.1",
+    "chess>=1.11.2",
+    "matplotlib>=3.9.4",
+    "scikit-learn>=1.6.1",
+    "seaborn>=0.13.2",
+    "stockfish>=3.28.0",
+    "streamlit>=1.43.2",
+    "tqdm>=4.67.1",
+]
 
 [project.urls]
 Homepage = "https://vandyG.github.io/chessticles"
@@ -89,7 +98,7 @@ ci = [
     "types-markdown>=3.6",
     "types-pyyaml>=6.0",
 ]
- docs = [
+docs = [
     "markdown-callouts>=0.4",
     "markdown-exec>=1.8",
     "mkdocs>=1.6",
@@ -102,6 +111,12 @@ ci = [
     "mkdocstrings[python]>=0.29",
     # YORE: EOL 3.10: Remove line.
     "tomli>=2.0; python_version < '3.11'",
+]
+dev = [
+    "ipykernel>=6.29.5",
+    "ipywidgets>=8.1.5",
+    "jupyter>=1.1.1",
+    "plotly>=6.0.1",
 ]
 
 [tool.uv]

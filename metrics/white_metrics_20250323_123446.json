@@ -1,0 +1,40 @@
+{
+    "model_version": "white_20250323_123446",
+    "player_color": "white",
+    "feature_names": [
+        "white_acl",
+        "black_acl",
+        "position_complexity",
+        "game_type_encoded",
+        "estimated_time",
+        "white_blunders",
+        "white_mistakes",
+        "white_inaccuracies",
+        "white_time_usage",
+        "white_eval_volatility",
+        "white_avg_time_per_move",
+        "white_time_pressure_moves",
+        "max_eval_advantage_white",
+        "opponent_elo"
+    ],
+    "training_size": 8072,
+    "testing_size": 2019,
+    "timestamp": "20250323_123446",
+    "best_parameters": {
+        "model__activation": "relu",
+        "model__alpha": 0.001,
+        "model__hidden_layer_sizes": [
+            100
+        ],
+        "model__learning_rate": "constant",
+        "model__max_iter": 5000
+    },
+    "train_mse": 19347.313599818594,
+    "test_mse": 22444.15800807891,
+    "train_mae": 84.0330846231384,
+    "test_mae": 87.32611527837157,
+    "train_r2": 0.860575273074351,
+    "test_r2": 0.8413134516703717,
+    "train_rmse": 139.0946210312196,
+    "test_rmse": 149.81374438975521
+}
