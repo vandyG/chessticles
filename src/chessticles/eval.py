@@ -802,8 +802,8 @@ if __name__ == "__main__":
         db_path="/home/vandy/work/chess/data/db.ocgdb.db3",
         stockfish_path="/home/vandy/.local/bin/stockfish",  # Path to Stockfish executable
         depth=14,  # Analysis depth
-        threads=4,  # Threads per engine
-        max_workers=4,  # Number of parallel processes
+        threads=2,  # Threads per engine
+        max_workers=8,  # Number of parallel processes
     )
 
     # Run analysis
