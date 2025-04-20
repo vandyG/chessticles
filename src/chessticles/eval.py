@@ -408,7 +408,7 @@ class ChessAnalyzer:
         connection: sqlite3.Connection,
         limit: Optional[int] = None,
         game_type_filter: str = "rapid",
-        offset: int = 0,
+        last_game_id: int = 0,
     ) -> sqlite3.Cursor:
         """Get games that haven't been analyzed yet, filtered by game type.
 
@@ -416,7 +416,7 @@ class ChessAnalyzer:
             connection (sqlite3.Connection): Database connection
             limit (int, optional): Maximum number of games to retrieve
             game_type_filter (str): Type of games to filter for (rapid, blitz, classical, etc.)
-            offset (int): Offset for pagination
+            last_game_id (int): ID of the last game processed for keyset pagination
 
         Returns:
             cursor: Cursor for the executed query.
@@ -433,16 +433,16 @@ class ChessAnalyzer:
         if game_type_filter:
             query += f" AND g.game_type = '{game_type_filter}' AND (g.MOVES != '1-0\n' AND g.MOVES != '0-1\n')"
 
+        # Apply offset for resuming analysis
+        if last_game_id > 0:
+            query += f" AND g.ID > {last_game_id}"
+
         # Add ORDER BY to ensure consistent results when using offset
         query += " ORDER BY g.ID"
 
         # Apply limit if specified
         if limit:
             query += f" LIMIT {limit}"
-
-        # Apply offset for resuming analysis
-        if offset > 0:
-            query += f" OFFSET {offset}"
 
         cursor.execute(query)
         return cursor
@@ -603,9 +603,9 @@ class ChessAnalyzer:
     def run_analysis(
         self,
         batch_size: int = 100,
-        total_games: int = None,
+        total_games: Optional[int] = None,
         game_type_filter: str = "rapid",
-        start_offset: int = 0,
+        resume_id: int = 0,
         tfrecord_dir: str = "tfrecords",
     ) -> None:
         """Run analysis on unanalyzed games in parallel.
@@ -618,19 +618,22 @@ class ChessAnalyzer:
             tfrecord_dir (str): Directory to save TFRecord files
         """
         games_processed = 0
-        current_offset = start_offset
+        last_game_id = resume_id
         batch_counter = 1
 
         # Create TFRecord directory if it doesn't exist
         os.makedirs(tfrecord_dir, exist_ok=True)
 
-        logger.info(f"Starting analysis of {game_type_filter} games with offset {start_offset}...")
+        logger.info(f"Starting analysis of {game_type_filter} games from ID: {last_game_id}...")
 
         while True:
             # Use a separate connection for fetching games since we'll be passing them to processes
             conn = sqlite3.connect(self.db_path)
             cursor = self.get_games_to_analyze(
-                conn, limit=batch_size, game_type_filter=game_type_filter, offset=current_offset
+                conn,
+                limit=batch_size,
+                game_type_filter=game_type_filter,
+                last_game_id=last_game_id,
             )
 
             games = cursor.fetchall()
@@ -641,11 +644,13 @@ class ChessAnalyzer:
                 break
 
             if total_games and games_processed >= total_games:
-                logger.warning(f"Reached target of {total_games} games")
+                logger.info(f"Reached target of {total_games} games")
                 break
 
             games_count = len(games)
-            logger.debug(f"Processing batch of {games_count} {game_type_filter} games (offset: {current_offset})...")
+            logger.debug(
+                f"Processing batch of {games_count} {game_type_filter} games (last game ID: {last_game_id})..."
+            )
 
             # Process games in parallel using ProcessPoolExecutor for CPU-bound tasks
             results = []
@@ -681,9 +686,12 @@ class ChessAnalyzer:
             logger.info(f"Exporting batch {batch_counter} to TFRecord...")
             # self.export_to_tfrecord(results, tfrecord_path)
 
+            if games:
+                last_game_id = games[-1][0]
+                logger.debug(f"Last Game ID: {last_game_id}")
+
             # Update counters
             games_processed += games_count
-            current_offset += games_count
             batch_counter += 1
 
             logger.info(f"Completed batch {batch_counter - 1}. Total games processed: {games_processed}")
@@ -705,13 +713,13 @@ if __name__ == "__main__":
     analyzer = ChessAnalyzer(
         Path("/home/vandy/work/chess/data/db.ocgdb.db3"),
         Path("/home/vandy/.local/bin/stockfish"),
-        depth=16,
+        depth=14,
         threads=2,
         max_workers=8,
     )
 
     # Run analysis
-    analyzer.run_analysis(100, total_games=100)
+    analyzer.run_analysis(100, total_games=500)
     # analyzer.run_analysis(batch_size=50, total_games=100000)
 
     # Generate visualizations
