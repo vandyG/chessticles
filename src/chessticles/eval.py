@@ -11,6 +11,8 @@ from typing import Any, Optional
 import chess
 import chess.engine
 import chess.pgn
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler
 import tensorflow as tf
 from tqdm import tqdm
 
@@ -272,7 +274,7 @@ class ChessAnalyzer:
                     "Skill Level": 20,  # Max strength
                     "UCI_LimitStrength": False,
                     "UCI_ShowWDL": True,
-                }
+                },
             )
         except Exception:
             logger.exception("Error initializing engine.")
@@ -510,7 +512,7 @@ class ChessAnalyzer:
                             move["losing_chance"],
                             move["is_check"],
                             move["is_checkmate"],
-                        )
+                        ),
                     )
 
                 cursor.executemany(
@@ -545,6 +547,14 @@ class ChessAnalyzer:
             return tf.train.Feature(bytes_list=tf.train.BytesList(value=[value]))
         raise ValueError(f"Unsupported type: {type(value)}")
 
+    def _create_int64_list_feature(self, values):
+        """Helper method for creating int64 list features."""
+        return tf.train.Feature(int64_list=tf.train.Int64List(value=values))
+
+    def _create_float_list_feature(self, values):
+        """Helper method for creating float list features."""
+        return tf.train.Feature(float_list=tf.train.FloatList(value=values))
+
     def normalize_estimated_time(self, est_t: int) -> float:
         return est_t / self.RAPID_THRESH
 
@@ -552,6 +562,125 @@ class ChessAnalyzer:
         """Normalize scalar features."""
         # scalar_scaler = MinMaxScaler(feature_range=(0, 1))
         return count / total_move_count
+
+    def encode_move(self, move_obj: chess.Move) -> np.array:
+        """Encode a python-chess move to a normalized 5D vector.
+
+        [from_col, from_row, to_col, to_row, promotion]
+        All values are scaled to [0, 1] for Transformer compatibility.
+        """
+        # move_obj = chess.Move.from_uci(move_obj) # uncomment if want to use string
+        if move_obj is None:
+            return np.array([0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        from_sq = move_obj.from_square
+        to_sq = move_obj.to_square
+
+        from_col = chess.square_file(from_sq) / 7.0
+        from_row = chess.square_rank(from_sq) / 7.0
+        to_col = chess.square_file(to_sq) / 7.0
+        to_row = chess.square_rank(to_sq) / 7.0
+
+        # Normalize promotion: 0 if not a promotion, else map [1, 2, 3, 4, 5] → [0.2, ..., 1.0]
+        # Promotion types: None (0), Knight (2), Bishop (3), Rook (4), Queen (5)
+        promotion_raw = move_obj.promotion if move_obj.promotion is not None else 0
+        promotion_normalized = promotion_raw / 5.0  # Max promotion code is 5 (Queen)
+        return np.array([from_col, from_row, to_col, to_row, promotion_normalized], dtype=np.float32)
+
+    def encode_fen(self, fen: str) -> np.array:
+        """Encode FEN string to include.
+
+        - Signed material values: white +ve, black -ve (normalized to [-1, 1])
+        - Castling rights (4 binary flags)
+        - En passant square (2 normalized floats)
+
+        Output shape: (64 + 4 + 2) = (70,)
+        """
+        casteling_index = 2
+        en_passent_index = 3
+
+        parts = fen.split(" ")
+        board_fen = parts[0]
+        castling = parts[2] if len(parts) > casteling_index else "-"
+        en_passant = parts[3] if len(parts) > en_passent_index else "-"
+
+        # --- 1. Encode signed board pieces ---
+        base_map = {
+            "p": -1,
+            "n": -2,
+            "b": -3,
+            "r": -4,
+            "q": -5,
+            "k": -6,
+            "P": 1,
+            "N": 2,
+            "B": 3,
+            "R": 4,
+            "Q": 5,
+            "K": 6,
+        }
+        expanded = ""
+        for ch in board_fen:
+            if ch.isdigit():
+                expanded += " " * int(ch)
+            elif ch == "/":
+                continue
+            else:
+                expanded += ch
+
+        # Map to values in [-1, 1] (divide by max absolute value 6)
+        board_encoded = [base_map.get(ch, 0) / 6.0 if ch != " " else 0.0 for ch in expanded]
+
+        # --- 2. Castling rights: [K, Q, k, q]
+        castling_flags = [
+            1.0 if "K" in castling else 0.0,
+            1.0 if "Q" in castling else 0.0,
+            1.0 if "k" in castling else 0.0,
+            1.0 if "q" in castling else 0.0,
+        ]
+
+        # --- 3. En passant square: normalized col and row
+        if en_passant != "-" and len(en_passant) == 2:
+            col = ord(en_passant[0]) - ord("a")  # 0-7
+            row = int(en_passant[1]) - 1  # 0-7
+            en_passant_encoded = [col / 7.0, row / 7.0]
+        else:
+            en_passant_encoded = [0.0, 0.0]
+
+        return np.array(board_encoded + castling_flags + en_passant_encoded, dtype=np.float32)
+
+    def create_mate_scaler(self, min_n: int = 0, max_n: int = 20) -> MinMaxScaler:
+        """Prepares a MinMaxScaler using 1 / exp(0.1 * mate_in_n) for mate_in_n in range(min_n, max_n)."""
+        mate_values = np.array([1 / np.exp(0.1 * n) for n in range(min_n, max_n + 1)]).reshape(-1, 1)
+        scaler = MinMaxScaler(feature_range=(0.0, 1.0))
+        scaler.fit(mate_values)
+        return scaler
+
+    def normalize_eval_and_mate(self, eval_score: chess.engine.Score, mate_in_n: Optional[int] = None):
+        """Normalize chess eval and mate-in-N.
+
+        Returns:
+            normalized_eval: [-0.99, 0.99], or ±1.0 if mate detected.
+            normalized_mate: [0.0, 1.0], 0.0 if mate_in_n > 20.
+        """
+        eval_scale = 1500.0
+        mate_pad_thresh = 20
+
+        mate_scaler = self.create_mate_scaler()
+
+        if mate_in_n is not None:
+            sign = np.sign(eval_score)
+            normalized_eval = sign * 1.0
+
+            if mate_in_n > mate_pad_thresh:
+                normalized_mate = 0.0
+            else:
+                raw_value = np.array([[1 / np.exp(0.1 * mate_in_n)]])
+                normalized_mate = mate_scaler.transform(raw_value)[0][0]
+        else:
+            normalized_eval = np.tanh(eval_score / eval_scale) * 0.99
+            normalized_mate = 0.0
+
+        return normalized_eval, normalized_mate
 
     def export_to_tfrecord(self, analysis_results: list[dict[str, Any]], output_path: str) -> None:
         """Export analysis results to TFRecord format.
@@ -568,7 +697,7 @@ class ChessAnalyzer:
                     if "error" in result:
                         continue
 
-                    game_id = result["game_id"]
+                    total_move_count = result["total_move_count"]
                     white_elo, black_elo = result["target"]
                     normalized_est = self.normalize_estimated_time(result["estimated_time"])
                     black_blunders, black_mistakes, black_inaccuracies = result["black_errors"]
@@ -580,17 +709,92 @@ class ChessAnalyzer:
                         "white_elo": self._create_tf_feature(white_elo),
                         "black_elo": self._create_tf_feature(black_elo),
                         "outcome": self._create_tf_feature(result["outcome"]),
+                        "total_move_count": self._create_tf_feature(total_move_count),
                         # Error counts
-                        "black_blunders": self._create_tf_feature(self.normalize_by_max_move(black_blunders)),
-                        "black_mistakes": self._create_tf_feature(self.normalize_by_max_move(black_mistakes)),
-                        "black_inaccuracies": self._create_tf_feature(self.normalize_by_max_move(black_inaccuracies)),
-                        "white_blunders": self._create_tf_feature(self.normalize_by_max_move(white_blunders)),
-                        "white_mistakes": self._create_tf_feature(self.normalize_by_max_move(white_mistakes)),
-                        "white_inaccuracies": self._create_tf_feature(self.normalize_by_max_move(white_inaccuracies)),
+                        "black_blunders": self._create_tf_feature(
+                            self.normalize_by_max_move(black_blunders, total_move_count)
+                        ),
+                        "black_mistakes": self._create_tf_feature(
+                            self.normalize_by_max_move(black_mistakes, total_move_count)
+                        ),
+                        "black_inaccuracies": self._create_tf_feature(
+                            self.normalize_by_max_move(black_inaccuracies, total_move_count)
+                        ),
+                        "white_blunders": self._create_tf_feature(
+                            self.normalize_by_max_move(white_blunders, total_move_count)
+                        ),
+                        "white_mistakes": self._create_tf_feature(
+                            self.normalize_by_max_move(white_mistakes, total_move_count)
+                        ),
+                        "white_inaccuracies": self._create_tf_feature(
+                            self.normalize_by_max_move(white_inaccuracies, total_move_count)
+                        ),
                     }
 
-                    # TODO: Add move level features as needed
-                    # This is a placeholder - implement the full encoding logic later
+                    # Move level features
+                    if "moves" in result:
+                        move_features = result["moves"]
+
+                        halfmove_count = []
+                        moves = []
+                        fens = []
+                        is_errors = []
+                        cp = []
+                        mate_in_n = []
+                        time_ratios = []
+                        winning_chance = []
+                        drawing_chance = []
+                        losing_chance = []
+                        check_flag = []
+                        mate_flag = []
+                        turn = []
+
+                        for move_data in move_features:
+                            halfmove_count.append(
+                                self.normalize_by_max_move(move_data["halfmove_count"], total_move_count)
+                            )
+                            moves.extend(self.encode_move(move_data["move"]))
+                            fens.extend(self.encode_fen(move_data["fen"]))
+                            is_errors.append(move_data["error"] / 3)
+
+                            normalized_score, normalized_mate = self.normalize_eval_and_mate(
+                                move_data["cp"],
+                                move_data["mate"],
+                            )
+                            cp.append(normalized_score)
+                            mate_in_n.append(normalized_mate)
+
+                            time_ratios.append(move_data["time_ratio"])
+                            winning_chance.append(move_data["winning_chance"])
+                            drawing_chance.append(move_data["drawing_chance"])
+                            losing_chance.append(move_data["losing_chance"])
+
+                            check_flag.append(move_data["is_check"])
+                            mate_flag.append(move_data["is_checkmate"])
+
+                            turn.append(move_data["turn"])
+
+                        # Add all move-level features to game_features
+                        game_features.update(
+                            {
+                                "halfmove_counts": self._create_float_list_feature(halfmove_count),
+                                "encoded_moves": self._create_float_list_feature(moves),
+                                "encoded_fens": self._create_float_list_feature(fens),
+                                "error_codes": self._create_float_list_feature(is_errors),
+                                "cp_scores": self._create_float_list_feature(cp),
+                                "time_ratios": self._create_float_list_feature(time_ratios),
+                                "mate_in_n": self._create_float_list_feature(mate_in_n),
+                                "winning_chances": self._create_float_list_feature(winning_chance),
+                                "drawing_chances": self._create_float_list_feature(drawing_chance),
+                                "losing_chances": self._create_float_list_feature(losing_chance),
+                                "check_flags": self._create_int64_list_feature(check_flag),
+                                "mate_flags": self._create_int64_list_feature(mate_flag),
+                                "turn": self._create_int64_list_feature(turn),
+                            }
+                        )
+
+                    with open("test.txt", "a") as file:
+                        file.writelines(str(game_features))
 
                     example = tf.train.Example(features=tf.train.Features(feature=game_features))
                     writer.write(example.SerializeToString())
@@ -598,7 +802,7 @@ class ChessAnalyzer:
             logger.info(f"Successfully exported to {output_path}")
 
         except Exception as e:
-            logger.exception(f"Error exporting to TFRecord: {e}")
+            logger.exception("Error exporting to TFRecord.")
 
     def run_analysis(
         self,
@@ -649,7 +853,7 @@ class ChessAnalyzer:
 
             games_count = len(games)
             logger.debug(
-                f"Processing batch of {games_count} {game_type_filter} games (last game ID: {last_game_id})..."
+                f"Processing batch of {games_count} {game_type_filter} games (last game ID: {last_game_id})...",
             )
 
             # Process games in parallel using ProcessPoolExecutor for CPU-bound tasks
@@ -679,12 +883,12 @@ class ChessAnalyzer:
 
             # Save results to database
             logger.info(f"Saving batch {batch_counter} results to database...")
-            # self.save_to_database(results)
+            self.save_to_database(results)
 
             # Export to TFRecord
             tfrecord_path = os.path.join(tfrecord_dir, f"{game_type_filter}_batch_{batch_counter}.tfrecord")
             logger.info(f"Exporting batch {batch_counter} to TFRecord...")
-            # self.export_to_tfrecord(results, tfrecord_path)
+            self.export_to_tfrecord(results, tfrecord_path)
 
             if games:
                 last_game_id = games[-1][0]
@@ -719,7 +923,7 @@ if __name__ == "__main__":
     )
 
     # Run analysis
-    analyzer.run_analysis(100, total_games=500)
+    analyzer.run_analysis(5000, total_games=100000, tfrecord_dir="data/tfrecords", resume_id=150554)
     # analyzer.run_analysis(batch_size=50, total_games=100000)
 
     # Generate visualizations
