@@ -37,6 +37,7 @@ dependencies = [
     "seaborn>=0.13.2",
     "stockfish>=3.28.0",
     "streamlit>=1.43.2",
+    "tensorflow[and-cuda]>=2.19.0",
     "tqdm>=4.67.1",
 ]
 
