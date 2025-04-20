@@ -1,22 +1,81 @@
-import concurrent.futures
+import concurrent
 import contextlib
 import io
-import json
 import os
-import re
 import sqlite3
+from enum import Enum
+from logging import CRITICAL, DEBUG, INFO, basicConfig, getLogger
 from pathlib import Path
+from typing import Any, Optional
 
 import chess
 import chess.engine
 import chess.pgn
-import matplotlib.pyplot as plt
-import pandas as pd
+import tensorflow as tf
 from tqdm import tqdm
+
+basicConfig(
+    filename="eval.log",
+    level=DEBUG,
+    format="%(asctime)s:%(filename)s:%(funcName)s:[%(levelname)s]: %(message)s",
+    force=True,
+    filemode="w",
+)
+logger = getLogger(__name__)
+
+# Disable all logs from chess.engine
+getLogger("chess.engine").setLevel(CRITICAL)
+
+# Silence asyncio DEBUG logs
+getLogger("asyncio").setLevel(INFO)
+
+# Set memory growth to avoid allocating all GPU memory at once
+physical_devices = tf.config.list_physical_devices("GPU")
+if physical_devices:
+    logger.info(f"Found {len(physical_devices)} GPU(s)")
+    for device in physical_devices:
+        tf.config.experimental.set_memory_growth(device, True)
+        logger.info(f"Memory growth set to True for {device}")
+else:
+    logger.warning("No GPU found, using CPU")
+
+# Use mixed precision to reduce memory usage.
+try:
+    policy = tf.keras.mixed_precision.Policy("mixed_float16")
+    tf.keras.mixed_precision.set_global_policy(policy)
+    logger.info("Using mixed precision policy")
+except Exception:
+    logger.warning("Mixed precision not supported or enabled")
+
+
+class Errors(Enum):
+    NONE = 0
+    INACCURACY = 1
+    MISTAKE = 2
+    BLUNDER = 3
+
+    @property
+    def threshold(self) -> float:
+        thresh = {
+            Errors.BLUNDER: 0.3,
+            Errors.MISTAKE: 0.2,
+            Errors.INACCURACY: 0.1,
+        }
+        return thresh[self]
 
 
 class ChessAnalyzer:
-    def __init__(self, db_path, stockfish_path="stockfish", depth=18, threads=4, max_workers=None):
+    MIN_PLY_COUNT = 5
+    RAPID_THRESH = 1499
+
+    def __init__(
+        self,
+        db_path: Path,
+        sf_path: Path = "stockfish",
+        depth: int = 18,
+        threads: int = 4,
+        max_workers: int | None = None,
+    ):
         """Initialize the chess analyzer.
 
         Args:
@@ -27,52 +86,84 @@ class ChessAnalyzer:
             max_workers (int): Maximum number of parallel workers
         """
         self.db_path = db_path
-        self.stockfish_path = stockfish_path
+        self.stockfish_path = sf_path
         self.depth = depth
         self.engine_threads = threads
         self.max_workers = max_workers or os.cpu_count()
 
-        # Validate that Stockfish is available
         try:
-            engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
+            engine = chess.engine.SimpleEngine.popen_uci(sf_path)
             engine.quit()
-            print(f"Stockfish found at {stockfish_path}")
-        except Exception as e:
-            print(f"Error initializing Stockfish: {e}")
-            print("Please provide a valid path to Stockfish executable")
+            logger.debug(f"Stockfish found at {sf_path}")
+        except Exception:
+            logger.exception("Error initializing Stockfish")
+            logger.debug("Please provide a valid path to Stockfish executable")
             raise
 
-        # Create a table for analysis results if it doesn't exist
-        self._init_analysis_table()
+        self._init_analysis_tables()
 
-    def _init_analysis_table(self):
-        """Create the analysis table if it doesn't exist."""
+    def _init_analysis_tables(self) -> None:
+        """Create the analysis tables if they don't exist."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
+        # Game level evaluations table
         cursor.execute("""
-        CREATE TABLE IF NOT EXISTS game_analysis (
+        CREATE TABLE IF NOT EXISTS evaluation_game_level (
             game_id INTEGER PRIMARY KEY,
-            white_acl REAL,             -- Average centipawn loss for white
-            black_acl REAL,             -- Average centipawn loss for black
-            white_blunders INTEGER,     -- Number of blunders by white
-            white_mistakes INTEGER,     -- Number of mistakes by white
-            white_inaccuracies INTEGER, -- Number of inaccuracies by white
-            black_blunders INTEGER,     -- Number of blunders by black
-            black_mistakes INTEGER,     -- Number of mistakes by black
-            black_inaccuracies INTEGER, -- Number of inaccuracies by black
-            time_eval_data BLOB,        -- JSON data for time vs eval correlation
             time_control TEXT,          -- Time control of the game
             estimated_time INTEGER,     -- Estimated game time in seconds
             game_type TEXT,             -- Game type (rapid, blitz, classical, etc.)
+            black_blunders INTEGER,     -- Number of blunders made by black
+            black_mistakes INTEGER,     -- Number of mistakes made by black
+            black_inaccuracies INTEGER, -- Number of inaccuracies made by black
+            white_blunders INTEGER,     -- Number of blunders made by white
+            white_mistakes INTEGER,     -- Number of mistakes made by white
+            white_inaccuracies INTEGER, -- Number of inaccuracies made by white
             analysis_completed TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """)
 
-        conn.commit()
-        conn.close()
+        # Move level evaluations table
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS evaluation_move_level (
+            game_id INTEGER,
+            halfmove_count INTEGER,
+            move TEXT,
+            fen TEXT,
+            turn INTEGER,               -- 0 for white, 1 for black
+            error INTEGER,              -- 0: none, 1: inaccuracy, 2: mistake, 3: blunder
+            cp INTEGER,                 -- Centipawn evaluation
+            mate INTEGER,               -- Mate in X moves (NULL if no mate)
+            time_ratio REAL,            -- Ratio of time spent on this move
+            winning_chance REAL,        -- Probability of winning
+            drawing_chance REAL,        -- Probability of drawing
+            losing_chance REAL,         -- Probability of losing
+            is_check INTEGER,           -- 1 if check, 0 otherwise
+            is_checkmate INTEGER,       -- 1 if checkmate, 0 otherwise
+            PRIMARY KEY (game_id, halfmove_count),
+            FOREIGN KEY (game_id) REFERENCES evaluation_game_level(game_id)
+        )
+        """)
 
-    def parse_time_control(self, time_control_str):
+        conn.commit()
+
+    def evaluate_move(self, wdl_before: chess.engine.Wdl, wdl_after: chess.engine.Wdl) -> Errors:
+        before_expected_score = wdl_before[0] + (0.5 * wdl_before[1])
+        after_expected_score = wdl_after[2] + (0.5 * wdl_after[1])
+
+        score_drop = (before_expected_score - after_expected_score) / 1000
+
+        if score_drop >= Errors.BLUNDER.threshold:
+            return Errors.BLUNDER
+        if score_drop >= Errors.MISTAKE.threshold:
+            return Errors.MISTAKE
+        if score_drop >= Errors.INACCURACY.threshold:
+            return Errors.INACCURACY
+
+        return Errors.NONE
+
+    def parse_time_control(self, time_control_str: str) -> tuple:
         """Parse the time control string and calculate estimated game time.
 
         Args:
@@ -97,93 +188,245 @@ class ChessAnalyzer:
                 return (base_time, increment, estimated_time)
             # Handle time formats without increment
             base_time = int(time_control_str)
-            return (base_time, 0, base_time)
-        except Exception as e:
-            print(f"Error parsing time control '{time_control_str}': {e}")
+        except Exception:
+            logger.exception(f"Error parsing time control '{time_control_str}'")
             return (None, None, None)
+        else:
+            return (base_time, 0, base_time)
 
-    def get_game_type(self, estimated_time):
-        """Determine game type based on estimated time.
+    def analyze_game(self, game_data: tuple[str]) -> dict[Any]:
+        """Analyze a single chess game using Stockfish.
 
         Args:
-            estimated_time (int): Estimated game time in seconds
+            game_data (tuple): Game data from the database
 
         Returns:
-            str: Game type (bullet, blitz, rapid, classical)
+            dict: Analysis results
         """
-        if estimated_time is None:
-            return "unknown"
+        game_id = game_data[0]
+        pgn_text = game_data[14]
+        time_control = game_data[10]
+        estimated_time = game_data[16]
+        game_type = game_data[17]
+        white_elo = game_data[6]
+        black_elo = game_data[8]
 
-        # Game type classification based on estimated time
-        if estimated_time <= 179:
-            return "bullet"
-        if estimated_time <= 479:
-            return "blitz"
-        if estimated_time <= 1499:
-            return "rapid"
-        return "classical"
+        if "1/2" in game_data[9]:
+            result = 0
+        elif game_data[9].startswith("1"):
+            result = 1
+        elif game_data[9].startswith("0"):
+            result = -1
 
-    def get_games_to_analyze(self, limit=None, game_type_filter="rapid", offset=0):
+        _, increment, _ = self.parse_time_control(time_control)
+
+        if not pgn_text or pgn_text == "":
+            logger.warning("No PGN data")
+            return {
+                "game_id": game_id,
+                "error": "No PGN data",
+                "time_control": time_control,
+                "estimated_time": estimated_time,
+                "game_type": game_type,
+            }
+
+        try:
+            pgn_io = io.StringIO(pgn_text)
+            game = chess.pgn.read_game(pgn_io)
+
+            if game is None:
+                logger.warning("Failed to parse PGN")
+                return {
+                    "game_id": game_id,
+                    "error": "Failed to parse PGN",
+                    "time_control": time_control,
+                    "estimated_time": estimated_time,
+                    "game_type": game_type,
+                }
+
+            if game.end().ply() / 2 < self.MIN_PLY_COUNT:
+                logger.warning(f"Game: ({game_id}) too short!")
+                return {
+                    "game_id": game_id,
+                    "error": "Game too short",
+                    "time_control": time_control,
+                    "estimated_time": estimated_time,
+                    "game_type": game_type,
+                }
+        except Exception:
+            logger.exception("Error parsing PGN")
+            return {
+                "game_id": game_id,
+                "error": "Error parsing PGN",
+                "time_control": time_control,
+                "estimated_time": estimated_time,
+                "game_type": game_type,
+            }
+
+        # Initialize Stockfish
+        try:
+            engine = chess.engine.SimpleEngine.popen_uci(self.stockfish_path)
+            engine.configure(
+                {
+                    "Threads": self.engine_threads,
+                    "Skill Level": 20,  # Max strength
+                    "UCI_LimitStrength": False,
+                    "UCI_ShowWDL": True,
+                }
+            )
+        except Exception:
+            logger.exception("Error initializing engine.")
+            return {
+                "game_id": game_id,
+                "error": "Error initializing engine",
+                "time_control": time_control,
+                "estimated_time": estimated_time,
+                "game_type": game_type,
+            }
+
+        try:
+            board = game.board()
+
+            move_features = []
+
+            white_blunders = 0
+            white_mistakes = 0
+            white_inaccuracies = 0
+            black_blunders = 0
+            black_mistakes = 0
+            black_inaccuracies = 0
+
+            curr_node = game
+            prev_node = chess.pgn.Game()
+
+            prev_prev_clock = None
+
+            turn = int(chess.BLACK)
+
+            halfmove_count = -1
+
+            while curr_node:
+                error = Errors.NONE
+                move = curr_node.move
+
+                if curr_node.parent is not None:
+                    board.push(move)
+
+                info = engine.analyse(board, chess.engine.Limit(depth=self.depth), info=chess.engine.Info.SCORE)
+
+                score = info["score"].white()
+                cp = score.score(mate_score=1000)
+                mate = score.mate()
+                time_spent = (
+                    0 if (not curr_node.parent) or (not prev_prev_clock) else prev_prev_clock - curr_node.clock()
+                )
+                time_ratio = (
+                    0 if (not prev_node.parent) or (not prev_prev_clock) else time_spent / (prev_prev_clock + increment)
+                )
+                halfmove_count += 1
+                turn = int(not turn)
+                is_check = board.is_check()
+                is_checkmate = board.is_checkmate()
+
+                try:
+                    curr_node.wdl = info["wdl"]
+                except KeyError:
+                    wdl = chess.engine.Wdl(1000, 0, 0)
+                    curr_node.wdl = chess.engine.PovWdl(wdl, not turn)
+
+                if curr_node.parent:
+                    error = self.evaluate_move(prev_node.wdl, curr_node.wdl)
+                    if error is Errors.BLUNDER:
+                        if turn is int(chess.BLACK):
+                            white_blunders += 1
+                        else:
+                            black_blunders += 1
+                    if error is Errors.MISTAKE:
+                        if turn is int(chess.BLACK):
+                            white_mistakes += 1
+                        else:
+                            black_mistakes += 1
+                    if error is Errors.INACCURACY:
+                        if turn is int(chess.BLACK):
+                            white_inaccuracies += 1
+                        else:
+                            black_inaccuracies += 1
+
+                features = {
+                    "halfmove_count": halfmove_count,
+                    "move": move,
+                    "fen": board.fen(),
+                    "turn": turn,
+                    "error": error.value,
+                    "cp": cp,
+                    "mate": mate,
+                    "time_ratio": time_ratio,
+                    "winning_chance": curr_node.wdl.white().winning_chance(),
+                    "drawing_chance": curr_node.wdl.white().drawing_chance(),
+                    "losing_chance": curr_node.wdl.white().losing_chance(),
+                    "is_check": int(is_check),
+                    "is_checkmate": int(is_checkmate),
+                }
+
+                move_features.append(features)
+
+                prev_prev_clock, prev_node, curr_node = prev_node.clock(), curr_node, curr_node.next()
+
+            # Close the engine
+            engine.quit()
+
+        except Exception:
+            # Make sure to quit the engine if an error occurs
+            with contextlib.suppress(Exception):
+                engine.quit()
+
+            logger.exception("Error analyzing game.")
+
+            return {
+                "game_id": game_id,
+                "error": "Error analyzing game",
+                "time_control": time_control,
+                "estimated_time": estimated_time,
+                "game_type": game_type,
+            }
+        else:
+            return {
+                "game_id": game_id,
+                "time_control": time_control,
+                "estimated_time": estimated_time,
+                "game_type": game_type,
+                "black_errors": (black_blunders, black_mistakes, black_inaccuracies),
+                "white_errors": (white_blunders, white_mistakes, white_inaccuracies),
+                "outcome": result,
+                "moves": move_features,
+                "target": (white_elo, black_elo),
+                "total_move_count": halfmove_count,
+            }
+
+    def get_games_to_analyze(
+        self,
+        connection: sqlite3.Connection,
+        limit: Optional[int] = None,
+        game_type_filter: str = "rapid",
+        offset: int = 0,
+    ) -> sqlite3.Cursor:
         """Get games that haven't been analyzed yet, filtered by game type.
 
         Args:
+            connection (sqlite3.Connection): Database connection
             limit (int, optional): Maximum number of games to retrieve
             game_type_filter (str): Type of games to filter for (rapid, blitz, classical, etc.)
+            offset (int): Offset for pagination
 
         Returns:
-            list: List of game tuples
+            cursor: Cursor for the executed query.
         """
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        cursor = connection.cursor()
 
-        # # Create a temporary view with game type calculation
-        # cursor.execute("""
-        # CREATE TEMPORARY VIEW IF NOT EXISTS game_with_type AS
-        # SELECT
-        #     g.*,
-        #     CASE
-        #         WHEN g.TimeControl LIKE '%+%' THEN
-        #             CAST(SUBSTR(g.TimeControl, 1, INSTR(g.TimeControl, '+')-1) AS INTEGER) +
-        #             (40 * CAST(SUBSTR(g.TimeControl, INSTR(g.TimeControl, '+')+1) AS INTEGER))
-        #         WHEN g.TimeControl IS NOT NULL AND g.TimeControl != '-' THEN
-        #             CAST(g.TimeControl AS INTEGER)
-        #         ELSE NULL
-        #     END AS estimated_time,
-        #     CASE
-        #         WHEN (CASE
-        #                 WHEN g.TimeControl LIKE '%+%' THEN
-        #                     CAST(SUBSTR(g.TimeControl, 1, INSTR(g.TimeControl, '+')-1) AS INTEGER) +
-        #                     (40 * CAST(SUBSTR(g.TimeControl, INSTR(g.TimeControl, '+')+1) AS INTEGER))
-        #                 WHEN g.TimeControl IS NOT NULL AND g.TimeControl != '-' THEN
-        #                     CAST(g.TimeControl AS INTEGER)
-        #                 ELSE NULL
-        #               END) <= 179 THEN 'bullet'
-        #         WHEN (CASE
-        #                 WHEN g.TimeControl LIKE '%+%' THEN
-        #                     CAST(SUBSTR(g.TimeControl, 1, INSTR(g.TimeControl, '+')-1) AS INTEGER) +
-        #                     (40 * CAST(SUBSTR(g.TimeControl, INSTR(g.TimeControl, '+')+1) AS INTEGER))
-        #                 WHEN g.TimeControl IS NOT NULL AND g.TimeControl != '-' THEN
-        #                     CAST(g.TimeControl AS INTEGER)
-        #                 ELSE NULL
-        #               END) <= 479 THEN 'blitz'
-        #         WHEN (CASE
-        #                 WHEN g.TimeControl LIKE '%+%' THEN
-        #                     CAST(SUBSTR(g.TimeControl, 1, INSTR(g.TimeControl, '+')-1) AS INTEGER) +
-        #                     (40 * CAST(SUBSTR(g.TimeControl, INSTR(g.TimeControl, '+')+1) AS INTEGER))
-        #                 WHEN g.TimeControl IS NOT NULL AND g.TimeControl != '-' THEN
-        #                     CAST(g.TimeControl AS INTEGER)
-        #                 ELSE NULL
-        #               END) <= 1499 THEN 'rapid'
-        #         ELSE 'classical'
-        #     END AS game_type
-        # FROM games g
-        # """)
-
-        # Query for games that don't have analysis, filtered by game type
         query = """
         SELECT g.* FROM game_with_type g
-        LEFT JOIN game_analysis a ON g.ID = a.game_id
-        WHERE a.game_id IS NULL
+        LEFT JOIN evaluation_game_level a ON g.ID = a.game_id
+        WHERE a.game_id IS NULL AND g.result IS NOT NULL
         """
 
         # Apply game type filter
@@ -202,338 +445,169 @@ class ChessAnalyzer:
             query += f" OFFSET {offset}"
 
         cursor.execute(query)
-        games = cursor.fetchall()
+        return cursor
 
-        conn.close()
-        return games
-
-    def parse_pgn(self, pgn_text):
-        """Parse a PGN string into a chess.pgn.Game object.
-
-        Args:
-            pgn_text (str): PGN text of the game
-
-        Returns:
-            tuple: (chess.pgn.Game, dict of clock times per move)
-        """
-        # Handle clock annotations
-        clock_times = {}
-
-        # Extract clock times using regex
-        clock_pattern = r"\[%clk\s+(\d+):(\d+):(\d+(?:\.\d+)?)\]"
-        move_num_pattern = r"(\d+)\.\.?\.\s+[^\s]+\s+\{\s*\[%clk"
-
-        move_clocks = []
-        for match in re.finditer(clock_pattern, pgn_text):
-            hours, minutes, seconds = match.groups()
-            time_in_seconds = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
-            move_clocks.append(time_in_seconds)
-
-        # Clean PGN for parsing
-        clean_pgn = re.sub(r"\{\s*\[%clk[^}]*\}\s*", "", pgn_text)
-
-        pgn_io = io.StringIO(clean_pgn)
-        game = chess.pgn.read_game(pgn_io)
-
-        if game is None:
-            return None, {}
-
-        # Assign clock times to moves
-        if move_clocks:
-            move_num = 0
-            clock_times = {}
-
-            # Walk through the game to assign clock times
-            node = game
-            while node.variations:
-                node = node.variations[0]
-                if move_num < len(move_clocks):
-                    clock_times[move_num] = move_clocks[move_num]
-                move_num += 1
-
-        return game, clock_times
-
-    def analyze_game(self, game_data):
-        """Analyze a single chess game using Stockfish.
-
-        Args:
-            game_data (tuple): Game data from the database
-
-        Returns:
-            dict: Analysis results
-        """
-        game_id = game_data[0]
-        pgn_text = game_data[14]
-        time_control = game_data[10]
-
-        # Parse time control and determine game type
-        base_time, increment, estimated_time = self.parse_time_control(time_control)
-        game_type = self.get_game_type(estimated_time)
-
-        if not pgn_text or pgn_text == "":
-            return {
-                "game_id": game_id,
-                "error": "No PGN data",
-                "time_control": time_control,
-                "estimated_time": estimated_time,
-                "game_type": game_type,
-            }
-
-        # Check if PGN already contains analysis
-        has_analysis = "eval" in pgn_text.lower() or "evaluation" in pgn_text.lower()
-
-        # Parse the PGN
-        try:
-            game, clock_times = self.parse_pgn(pgn_text)
-
-            if game is None:
-                return {
-                    "game_id": game_id,
-                    "error": "Failed to parse PGN",
-                    "time_control": time_control,
-                    "estimated_time": estimated_time,
-                    "game_type": game_type,
-                }
-            if sum(1 for _ in game.mainline_moves()) < 5:
-                return {
-                    "game_id": game_id,
-                    "error": "Game too short",
-                    "time_control": time_control,
-                    "estimated_time": estimated_time,
-                    "game_type": game_type,
-                }
-        except Exception as e:
-            return {
-                "game_id": game_id,
-                "error": f"Error parsing PGN: {e!s}",
-                "time_control": time_control,
-                "estimated_time": estimated_time,
-                "game_type": game_type,
-            }
-
-        # Initialize Stockfish
-        try:
-            engine = chess.engine.SimpleEngine.popen_uci(self.stockfish_path)
-            engine.configure({"Threads": self.engine_threads})
-        except Exception as e:
-            return {
-                "game_id": game_id,
-                "error": f"Error initializing engine: {e!s}",
-                "time_control": time_control,
-                "estimated_time": estimated_time,
-                "game_type": game_type,
-            }
-
-        try:
-            # Initialize variables to track analysis
-            white_errors = {"blunders": 0, "mistakes": 0, "inaccuracies": 0}
-            black_errors = {"blunders": 0, "mistakes": 0, "inaccuracies": 0}
-            white_cp_loss = []
-            black_cp_loss = []
-
-            # Prepare time-eval correlation data
-            time_eval_data = {
-                "white": {"times": [], "evals": [], "moves": []},
-                "black": {"times": [], "evals": [], "moves": []},
-            }
-
-            # Analyze the game
-            board = game.board()
-            prev_eval = None
-            move_num = 0
-
-            # Walk through the game
-            node = game
-            while node.variations:
-                next_node = node.variations[0]
-                move = next_node.move
-
-                # Current player (True for white, False for black)
-                is_white = board.turn == chess.WHITE
-                player_key = "white" if is_white else "black"
-
-                # Get evaluation before the move
-                if prev_eval is None:
-                    info = engine.analyse(board, chess.engine.Limit(depth=self.depth))
-                    eval_before = self._get_eval_score(info, board.turn)
-                else:
-                    eval_before = prev_eval
-
-                # Make the move and get evaluation after
-                board.push(move)
-                info = engine.analyse(board, chess.engine.Limit(depth=self.depth))
-                eval_after = self._get_eval_score(info, not board.turn)
-
-                # Calculate centipawn loss
-                cp_loss = self._calculate_cp_loss(eval_before, eval_after, is_white)
-
-                # Store the loss
-                if is_white:
-                    white_cp_loss.append(cp_loss)
-                    # Classify the move
-                    if cp_loss >= 300:  # Blunder
-                        white_errors["blunders"] += 1
-                    elif cp_loss >= 100:  # Mistake
-                        white_errors["mistakes"] += 1
-                    elif cp_loss >= 50:  # Inaccuracy
-                        white_errors["inaccuracies"] += 1
-                else:
-                    black_cp_loss.append(cp_loss)
-                    # Classify the move
-                    if cp_loss >= 300:  # Blunder
-                        black_errors["blunders"] += 1
-                    elif cp_loss >= 100:  # Mistake
-                        black_errors["mistakes"] += 1
-                    elif cp_loss >= 50:  # Inaccuracy
-                        black_errors["inaccuracies"] += 1
-
-                # Record time and evaluation data if clock info is available
-                if move_num in clock_times:
-                    time_left = clock_times[move_num]
-                    time_eval_data[player_key]["times"].append(time_left)
-                    time_eval_data[player_key]["evals"].append(eval_after)
-                    time_eval_data[player_key]["moves"].append(move_num)
-
-                # Store the current evaluation for next iteration
-                prev_eval = eval_after
-                move_num += 1
-                node = next_node
-
-            # Calculate average centipawn loss
-            white_acl = sum(white_cp_loss) / len(white_cp_loss) if white_cp_loss else 0
-            black_acl = sum(black_cp_loss) / len(black_cp_loss) if black_cp_loss else 0
-
-            # Close the engine
-            engine.quit()
-
-            # Convert time-eval data to JSON-serializable format
-            time_eval_json = json.dumps(time_eval_data)
-
-            # Return the analysis results
-            return {
-                "game_id": game_id,
-                "white_acl": white_acl,
-                "black_acl": black_acl,
-                "white_blunders": white_errors["blunders"],
-                "white_mistakes": white_errors["mistakes"],
-                "white_inaccuracies": white_errors["inaccuracies"],
-                "black_blunders": black_errors["blunders"],
-                "black_mistakes": black_errors["mistakes"],
-                "black_inaccuracies": black_errors["inaccuracies"],
-                "time_eval_data": time_eval_json,
-                "time_control": time_control,
-                "estimated_time": estimated_time,
-                "game_type": game_type,
-            }
-
-        except Exception as e:
-            # Make sure to quit the engine if an error occurs
-            with contextlib.suppress(Exception):
-                engine.quit()
-
-            return {
-                "game_id": game_id,
-                "error": f"Error analyzing game: {e!s}",
-                "time_control": time_control,
-                "estimated_time": estimated_time,
-                "game_type": game_type,
-            }
-
-    def _get_eval_score(self, info, turn):
-        """Convert Stockfish evaluation to a numerical score.
-
-        Args:
-            info (dict): Stockfish analysis info
-            turn (bool): Current player's turn (True for white, False for black)
-
-        Returns:
-            float: Evaluation in centipawns from white's perspective
-        """
-        if "score" not in info:
-            return 0
-
-        score = info["score"].relative
-
-        # Handle mate scores
-        if score.mate() is not None:
-            if score.mate() > 0:
-                return 10000 - score.mate() * 10  # Winning
-            return -10000 - score.mate() * 10  # Losing
-
-        # Regular centipawn score
-        return score.score()
-
-    def _calculate_cp_loss(self, eval_before, eval_after, is_white):
-        """Calculate centipawn loss for a move.
-
-        Args:
-            eval_before (float): Evaluation before the move
-            eval_after (float): Evaluation after the move
-            is_white (bool): Whether the player is white
-
-        Returns:
-            float: Centipawn loss
-        """
-        # For white, a decreasing eval is bad
-        cp_loss = max(0, eval_before - eval_after) if is_white else max(0, eval_after - eval_before)
-
-        return cp_loss
-
-    def save_analysis(self, analysis_results):
+    def save_to_database(self, analysis_results: list[dict[str, Any]]) -> None:
         """Save analysis results to the database.
 
         Args:
-            analysis_results (dict): Analysis results
+            analysis_results (List[Dict]): List of analysis results from analyzed games
         """
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
-        for index, analysis_result in enumerate(analysis_results):
-            if "error" in analysis_result:
-                # print(f"Error for game {analysis_result['game_id']}: {analysis_result['error']}")
-                # return False
-                analysis_results.pop(index)
-
         try:
-            cursor.executemany(
-                """
-            INSERT INTO game_analysis
-            (game_id, white_acl, black_acl, 
-             white_blunders, white_mistakes, white_inaccuracies,
-             black_blunders, black_mistakes, black_inaccuracies,
-             time_eval_data, time_control, estimated_time, game_type)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-                [
+            conn.execute("BEGIN TRANSACTION")
+
+            for result in analysis_results:
+                if "error" in result:
+                    logger.warning(f"Skipping game {result['game_id']} due to error: {result['error']}")
+                    continue
+
+                # Insert game level data
+                game_id = result["game_id"]
+                black_blunders, black_mistakes, black_inaccuracies = result["black_errors"]
+                white_blunders, white_mistakes, white_inaccuracies = result["white_errors"]
+
+                cursor.execute(
+                    """
+                INSERT INTO evaluation_game_level 
+                (game_id, time_control, estimated_time, game_type, 
+                black_blunders, black_mistakes, black_inaccuracies,
+                white_blunders, white_mistakes, white_inaccuracies)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
                     (
-                        analysis_result["game_id"],
-                        analysis_result["white_acl"],
-                        analysis_result["black_acl"],
-                        analysis_result["white_blunders"],
-                        analysis_result["white_mistakes"],
-                        analysis_result["white_inaccuracies"],
-                        analysis_result["black_blunders"],
-                        analysis_result["black_mistakes"],
-                        analysis_result["black_inaccuracies"],
-                        analysis_result["time_eval_data"],
-                        analysis_result["time_control"],
-                        analysis_result["estimated_time"],
-                        analysis_result["game_type"],
+                        game_id,
+                        result["time_control"],
+                        result["estimated_time"],
+                        result["game_type"],
+                        black_blunders,
+                        black_mistakes,
+                        black_inaccuracies,
+                        white_blunders,
+                        white_mistakes,
+                        white_inaccuracies,
+                    ),
+                )
+
+                # Insert move level data
+                move_data = []
+                for move in result["moves"]:
+                    move_data.append(
+                        (
+                            game_id,
+                            move["halfmove_count"],
+                            str(move["move"]),
+                            move["fen"],
+                            move["turn"],
+                            move["error"],
+                            move["cp"],
+                            move["mate"],
+                            move["time_ratio"],
+                            move["winning_chance"],
+                            move["drawing_chance"],
+                            move["losing_chance"],
+                            move["is_check"],
+                            move["is_checkmate"],
+                        )
                     )
-                    for analysis_result in analysis_results
-                ],
-            )
+
+                cursor.executemany(
+                    """
+                INSERT INTO evaluation_move_level
+                (game_id, halfmove_count, move, fen, turn, error, cp, mate,
+                time_ratio, winning_chance, drawing_chance, losing_chance,
+                is_check, is_checkmate)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                    move_data,
+                )
 
             conn.commit()
-            conn.close()
-        except Exception as e:
-            conn.close()
-            print(f"Error saving analysis for game {analysis_results['game_id']}: {e}")
-            return False
-        else:
-            return True
+            logger.info(f"Successfully saved {len(analysis_results)} games to database")
 
-    def run_analysis(self, batch_size=100, total_games=None, game_type_filter="rapid", start_offset=0):
+        except Exception as e:
+            conn.rollback()
+            logger.exception(f"Error saving to database: {e}")
+        finally:
+            conn.close()
+
+    def _create_tf_feature(self, value: Any) -> Any:
+        """Create appropriate TensorFlow feature from a value."""
+        if isinstance(value, int):
+            return tf.train.Feature(int64_list=tf.train.Int64List(value=[value]))
+        if isinstance(value, float):
+            return tf.train.Feature(float_list=tf.train.FloatList(value=[value]))
+        if isinstance(value, str):
+            return tf.train.Feature(bytes_list=tf.train.BytesList(value=[value.encode("utf-8")]))
+        if isinstance(value, bytes):
+            return tf.train.Feature(bytes_list=tf.train.BytesList(value=[value]))
+        raise ValueError(f"Unsupported type: {type(value)}")
+
+    def normalize_estimated_time(self, est_t: int) -> float:
+        return est_t / self.RAPID_THRESH
+
+    def normalize_by_max_move(self, count: int, total_move_count: int) -> float:
+        """Normalize scalar features."""
+        # scalar_scaler = MinMaxScaler(feature_range=(0, 1))
+        return count / total_move_count
+
+    def export_to_tfrecord(self, analysis_results: list[dict[str, Any]], output_path: str) -> None:
+        """Export analysis results to TFRecord format.
+
+        Args:
+            analysis_results (List[Dict]): List of analysis results from analyzed games
+            output_path (str): Path to save the TFRecord file
+        """
+        logger.info(f"Exporting {len(analysis_results)} games to TFRecord at {output_path}")
+
+        try:
+            with tf.io.TFRecordWriter(output_path) as writer:
+                for result in analysis_results:
+                    if "error" in result:
+                        continue
+
+                    game_id = result["game_id"]
+                    white_elo, black_elo = result["target"]
+                    normalized_est = self.normalize_estimated_time(result["estimated_time"])
+                    black_blunders, black_mistakes, black_inaccuracies = result["black_errors"]
+                    white_blunders, white_mistakes, white_inaccuracies = result["white_errors"]
+
+                    # Game level features
+                    game_features = {
+                        "estimated_time": self._create_tf_feature(normalized_est),
+                        "white_elo": self._create_tf_feature(white_elo),
+                        "black_elo": self._create_tf_feature(black_elo),
+                        "outcome": self._create_tf_feature(result["outcome"]),
+                        # Error counts
+                        "black_blunders": self._create_tf_feature(self.normalize_by_max_move(black_blunders)),
+                        "black_mistakes": self._create_tf_feature(self.normalize_by_max_move(black_mistakes)),
+                        "black_inaccuracies": self._create_tf_feature(self.normalize_by_max_move(black_inaccuracies)),
+                        "white_blunders": self._create_tf_feature(self.normalize_by_max_move(white_blunders)),
+                        "white_mistakes": self._create_tf_feature(self.normalize_by_max_move(white_mistakes)),
+                        "white_inaccuracies": self._create_tf_feature(self.normalize_by_max_move(white_inaccuracies)),
+                    }
+
+                    # TODO: Add move level features as needed
+                    # This is a placeholder - implement the full encoding logic later
+
+                    example = tf.train.Example(features=tf.train.Features(feature=game_features))
+                    writer.write(example.SerializeToString())
+
+            logger.info(f"Successfully exported to {output_path}")
+
+        except Exception as e:
+            logger.exception(f"Error exporting to TFRecord: {e}")
+
+    def run_analysis(
+        self,
+        batch_size: int = 100,
+        total_games: int = None,
+        game_type_filter: str = "rapid",
+        start_offset: int = 0,
+        tfrecord_dir: str = "tfrecords",
+    ) -> None:
         """Run analysis on unanalyzed games in parallel.
 
         Args:
@@ -541,273 +615,104 @@ class ChessAnalyzer:
             total_games (int, optional): Total number of games to process
             game_type_filter (str): Type of games to analyze (rapid, blitz, classical, etc.)
             start_offset (int, optional): Initial offset for resuming a previous analysis run
+            tfrecord_dir (str): Directory to save TFRecord files
         """
         games_processed = 0
         current_offset = start_offset
+        batch_counter = 1
 
-        print(f"Starting analysis of {game_type_filter} games with offset {start_offset}...")
+        # Create TFRecord directory if it doesn't exist
+        os.makedirs(tfrecord_dir, exist_ok=True)
 
-        # Process games in batches
+        logger.info(f"Starting analysis of {game_type_filter} games with offset {start_offset}...")
+
         while True:
-            # Get a batch of games to analyze with current offset
-            games = self.get_games_to_analyze(
-                limit=batch_size,
-                game_type_filter=game_type_filter,
-                offset=current_offset,
+            # Use a separate connection for fetching games since we'll be passing them to processes
+            conn = sqlite3.connect(self.db_path)
+            cursor = self.get_games_to_analyze(
+                conn, limit=batch_size, game_type_filter=game_type_filter, offset=current_offset
             )
 
+            games = cursor.fetchall()
+            conn.close()
+
             if not games:
-                print(f"No more {game_type_filter} games to analyze")
+                logger.warning(f"No more {game_type_filter} games to analyze")
                 break
 
             if total_games and games_processed >= total_games:
-                print(f"Reached target of {total_games} games")
+                logger.warning(f"Reached target of {total_games} games")
                 break
 
-            print(f"Processing batch of {len(games)} {game_type_filter} games (offset: {current_offset})...")
+            games_count = len(games)
+            logger.debug(f"Processing batch of {games_count} {game_type_filter} games (offset: {current_offset})...")
 
-            # Process games in parallel
+            # Process games in parallel using ProcessPoolExecutor for CPU-bound tasks
             results = []
             with concurrent.futures.ProcessPoolExecutor(max_workers=self.max_workers) as executor:
-                # Submit jobs
-                future_to_game = {executor.submit(self.analyze_game, game): game for game in games}
+                # We need to provide all necessary instance variables to analyze_game
+                # since it will be executed in a separate process
+                future_to_game = {
+                    executor.submit(
+                        self.analyze_game,
+                        game,
+                    ): game
+                    for game in games
+                }
 
-                # Process as they complete
                 for future in tqdm(concurrent.futures.as_completed(future_to_game), total=len(games)):
-                    game = future_to_game[future]
                     try:
-                        result = future.result()
-                        if "error" not in result:
-                            # self.save_analysis(result)
-                            games_processed += 1
-                            results.append(result)
-                    except Exception as e:
-                        print(f"Error processing game {game[0]}: {e}")
+                        game_result = future.result()
+                        results.append(game_result)
 
-            # Print summary for this batch
-            self.save_analysis(results)
-            success = sum(1 for r in results if "error" not in r)
-            error = sum(1 for r in results if "error" in r)
-            print(f"Batch completed: {success} successful, {error} errors")
-            print(f"Total {game_type_filter} games processed so far: {games_processed}")
+                        # Log progress periodically
+                        if len(results) % 10 == 0:
+                            logger.info(f"Analyzed {len(results)}/{games_count} games in current batch")
+                    except Exception:
+                        game_id = future_to_game[future][0]  # First element is typically game_id
+                        logger.exception(f"Game {game_id} generated an exception.")
 
-            # Update the offset for the next batch
-            # We need to increase by the batch size, not just the number of successful analyses,
-            # because we want to skip all games we've already attempted, even errors
-            current_offset += len(games)
+            # Save results to database
+            logger.info(f"Saving batch {batch_counter} results to database...")
+            # self.save_to_database(results)
 
-            if total_games and games_processed >= total_games:
-                print(f"Reached target of {total_games} {game_type_filter} games")
-                break
+            # Export to TFRecord
+            tfrecord_path = os.path.join(tfrecord_dir, f"{game_type_filter}_batch_{batch_counter}.tfrecord")
+            logger.info(f"Exporting batch {batch_counter} to TFRecord...")
+            # self.export_to_tfrecord(results, tfrecord_path)
 
-    def analyze_game_time_distribution(self):
-        """Analyze the distribution of game types in the database."""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+            # Update counters
+            games_processed += games_count
+            current_offset += games_count
+            batch_counter += 1
 
-        # Create a temporary view with game type calculation
-        cursor.execute("""
-        CREATE TEMPORARY VIEW IF NOT EXISTS game_time_analysis AS
-        SELECT 
-            CASE 
-                WHEN g.TimeControl LIKE '%+%' THEN 
-                    CAST(SUBSTR(g.TimeControl, 1, INSTR(g.TimeControl, '+')-1) AS INTEGER) + 
-                    (40 * CAST(SUBSTR(g.TimeControl, INSTR(g.TimeControl, '+')+1) AS INTEGER))
-                WHEN g.TimeControl IS NOT NULL AND g.TimeControl != '-' THEN
-                    CAST(g.TimeControl AS INTEGER)
-                ELSE NULL
-            END AS estimated_time,
-            CASE 
-                WHEN (CASE 
-                        WHEN g.TimeControl LIKE '%+%' THEN 
-                            CAST(SUBSTR(g.TimeControl, 1, INSTR(g.TimeControl, '+')-1) AS INTEGER) + 
-                            (40 * CAST(SUBSTR(g.TimeControl, INSTR(g.TimeControl, '+')+1) AS INTEGER))
-                        WHEN g.TimeControl IS NOT NULL AND g.TimeControl != '-' THEN
-                            CAST(g.TimeControl AS INTEGER)
-                        ELSE NULL
-                      END) <= 179 THEN 'bullet'
-                WHEN (CASE 
-                        WHEN g.TimeControl LIKE '%+%' THEN 
-                            CAST(SUBSTR(g.TimeControl, 1, INSTR(g.TimeControl, '+')-1) AS INTEGER) + 
-                            (40 * CAST(SUBSTR(g.TimeControl, INSTR(g.TimeControl, '+')+1) AS INTEGER))
-                        WHEN g.TimeControl IS NOT NULL AND g.TimeControl != '-' THEN
-                            CAST(g.TimeControl AS INTEGER)
-                        ELSE NULL
-                      END) <= 479 THEN 'blitz'
-                WHEN (CASE 
-                        WHEN g.TimeControl LIKE '%+%' THEN 
-                            CAST(SUBSTR(g.TimeControl, 1, INSTR(g.TimeControl, '+')-1) AS INTEGER) + 
-                            (40 * CAST(SUBSTR(g.TimeControl, INSTR(g.TimeControl, '+')+1) AS INTEGER))
-                        WHEN g.TimeControl IS NOT NULL AND g.TimeControl != '-' THEN
-                            CAST(g.TimeControl AS INTEGER)
-                        ELSE NULL
-                      END) <= 1499 THEN 'rapid'
-                ELSE 'classical'
-            END AS game_type,
-            COUNT(*) as count
-        FROM games g
-        GROUP BY game_type
-        """)
+            logger.info(f"Completed batch {batch_counter - 1}. Total games processed: {games_processed}")
 
-        cursor.execute("SELECT game_type, count FROM game_time_analysis")
-        results = cursor.fetchall()
-
-        conn.close()
-
-        # Print and visualize the results
-        print("\nGame Type Distribution:")
-        total = sum(row[1] for row in results)
-
-        for game_type, count in results:
-            percentage = (count / total) * 100 if total > 0 else 0
-            print(f"{game_type}: {count} games ({percentage:.2f}%)")
-
-        # Visualize
-        if results:
-            plt.figure(figsize=(10, 6))
-            game_types = [row[0] or "unknown" for row in results]
-            counts = [row[1] for row in results]
-
-            plt.bar(game_types, counts)
-            plt.xlabel("Game Type")
-            plt.ylabel("Number of Games")
-            plt.title("Distribution of Chess Games by Time Control")
-
-            # Add count labels on top of bars
-            for i, count in enumerate(counts):
-                plt.text(i, count + 0.5, str(count), ha="center")
-
-            plt.tight_layout()
-            plt.savefig("game_type_distribution.png")
-            print("Distribution chart saved as 'game_type_distribution.png'")
-
-    def visualize_results(self, limit=100, game_type_filter=None):
-        """Generate visualizations of analysis results.
-
-        Args:
-            limit (int): Number of games to include in visualizations
-            game_type_filter (str, optional): Filter visualizations to a specific game type
-        """
-        conn = sqlite3.connect(self.db_path)
-
-        # Get analysis data
-        query = """
-        SELECT 
-            game_id, white_acl, black_acl, 
-            white_blunders, white_mistakes, white_inaccuracies,
-            black_blunders, black_mistakes, black_inaccuracies,
-            time_eval_data, time_control, estimated_time, game_type
-        FROM game_analysis
-        """
-
-        if game_type_filter:
-            query += f" WHERE game_type = '{game_type_filter}'"
-
-        query += f" LIMIT {limit}"
-
-        df = pd.read_sql_query(query, conn)
-        conn.close()
-
-        if df.empty:
-            print("No analysis data available")
-            return
-
-        # Create output directory
-        output_dir = Path("analysis_results")
-        output_dir.mkdir(exist_ok=True)
-
-        # Add a prefix to output files if filtering by game type
-        prefix = f"{game_type_filter}_" if game_type_filter else ""
-
-        # Plot average centipawn loss distribution
-        plt.figure(figsize=(10, 6))
-        plt.hist(df["white_acl"], alpha=0.5, label="White")
-        plt.hist(df["black_acl"], alpha=0.5, label="Black")
-        plt.xlabel("Average Centipawn Loss")
-        plt.ylabel("Number of Games")
-        title = "Distribution of Average Centipawn Loss"
-        if game_type_filter:
-            title += f" ({game_type_filter} games)"
-        plt.title(title)
-        plt.legend()
-        plt.savefig(output_dir / f"{prefix}acl_distribution.png")
-
-        # Plot average mistakes/blunders
-        errors = pd.DataFrame(
-            {
-                "White": [df["white_blunders"].mean(), df["white_mistakes"].mean(), df["white_inaccuracies"].mean()],
-                "Black": [df["black_blunders"].mean(), df["black_mistakes"].mean(), df["black_inaccuracies"].mean()],
-            },
-            index=["Blunders", "Mistakes", "Inaccuracies"],
-        )
-
-        errors.plot(kind="bar", figsize=(10, 6))
-        title = "Average Number of Errors per Game"
-        if game_type_filter:
-            title += f" ({game_type_filter} games)"
-        plt.title(title)
-        plt.ylabel("Count")
-        plt.savefig(output_dir / f"{prefix}average_errors.png")
-
-        # Sample time-eval correlation for a few games
-        for i in range(min(5, len(df))):
-            try:
-                game_id = df.iloc[i]["game_id"]
-                time_data = json.loads(df.iloc[i]["time_eval_data"])
-
-                plt.figure(figsize=(12, 6))
-
-                # White player
-                if time_data["white"]["times"]:
-                    plt.subplot(1, 2, 1)
-                    plt.scatter(
-                        time_data["white"]["times"],
-                        time_data["white"]["evals"],
-                        alpha=0.7,
-                        c=time_data["white"]["moves"],
-                        cmap="viridis",
-                    )
-                    plt.colorbar(label="Move Number")
-                    plt.xlabel("Time Left (seconds)")
-                    plt.ylabel("Evaluation (centipawns)")
-                    plt.title(f"White Player - Game {game_id}")
-
-                # Black player
-                if time_data["black"]["times"]:
-                    plt.subplot(1, 2, 2)
-                    plt.scatter(
-                        time_data["black"]["times"],
-                        time_data["black"]["evals"],
-                        alpha=0.7,
-                        c=time_data["black"]["moves"],
-                        cmap="viridis",
-                    )
-                    plt.colorbar(label="Move Number")
-                    plt.xlabel("Time Left (seconds)")
-                    plt.ylabel("Evaluation (centipawns)")
-                    plt.title(f"Black Player - Game {game_id}")
-
-                plt.tight_layout()
-                plt.savefig(output_dir / f"time_eval_game_{game_id}.png")
-                plt.close()
-
-            except Exception as e:
-                print(f"Error creating visualization for game {i}: {e}")
+        logger.info(f"Analysis complete. Processed {games_processed} games.")
 
 
 # Example usage
 if __name__ == "__main__":
     # Initialize the analyzer
+    # analyzer = ChessAnalyzer(
+    #     db_path="/home/vandy/work/chess/data/db.ocgdb.db3",
+    #     stockfish_path="/home/vandy/.local/bin/stockfish",  # Path to Stockfish executable
+    #     depth=14,  # Analysis depth
+    #     threads=2,  # Threads per engine
+    #     max_workers=8,  # Number of parallel processes
+    # )
+
     analyzer = ChessAnalyzer(
-        db_path="/home/vandy/work/chess/data/db.ocgdb.db3",
-        stockfish_path="/home/vandy/.local/bin/stockfish",  # Path to Stockfish executable
-        depth=14,  # Analysis depth
-        threads=2,  # Threads per engine
-        max_workers=8,  # Number of parallel processes
+        Path("/home/vandy/work/chess/data/db.ocgdb.db3"),
+        Path("/home/vandy/.local/bin/stockfish"),
+        depth=16,
+        threads=2,
+        max_workers=8,
     )
 
     # Run analysis
-    analyzer.run_analysis(batch_size=50, total_games=100000)
+    analyzer.run_analysis(100, total_games=100)
+    # analyzer.run_analysis(batch_size=50, total_games=100000)
 
     # Generate visualizations
-    analyzer.visualize_results(limit=100)
+    # analyzer.visualize_results(limit=100)
