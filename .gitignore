@@ -25,5 +25,5 @@ uv.lock
 __pycache__/
 
 .envrc
-
+*.DS_STORE
 data/
