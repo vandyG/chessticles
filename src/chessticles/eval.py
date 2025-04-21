@@ -1,3 +1,5 @@
+"""Runs evaluation on chess games and loads them to database and TFRecord."""
+
 import concurrent
 import contextlib
 import io
@@ -12,8 +14,8 @@ import chess
 import chess.engine
 import chess.pgn
 import numpy as np
-from sklearn.preprocessing import MinMaxScaler
 import tensorflow as tf
+from sklearn.preprocessing import MinMaxScaler
 from tqdm import tqdm
 
 basicConfig(
@@ -36,7 +38,7 @@ physical_devices = tf.config.list_physical_devices("GPU")
 if physical_devices:
     logger.info(f"Found {len(physical_devices)} GPU(s)")
     for device in physical_devices:
-        tf.config.experimental.set_memory_growth(device, True)
+        tf.config.experimental.set_memory_growth(device, True)  # noqa: FBT003
         logger.info(f"Memory growth set to True for {device}")
 else:
     logger.warning("No GPU found, using CPU")
@@ -46,7 +48,7 @@ try:
     policy = tf.keras.mixed_precision.Policy("mixed_float16")
     tf.keras.mixed_precision.set_global_policy(policy)
     logger.info("Using mixed precision policy")
-except Exception:
+except Exception:  # noqa: BLE001
     logger.warning("Mixed precision not supported or enabled")
 
 
@@ -473,8 +475,8 @@ class ChessAnalyzer:
 
                 cursor.execute(
                     """
-                INSERT INTO evaluation_game_level 
-                (game_id, time_control, estimated_time, game_type, 
+                INSERT INTO evaluation_game_level
+                (game_id, time_control, estimated_time, game_type,
                 black_blunders, black_mistakes, black_inaccuracies,
                 white_blunders, white_mistakes, white_inaccuracies)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -529,9 +531,9 @@ class ChessAnalyzer:
             conn.commit()
             logger.info(f"Successfully saved {len(analysis_results)} games to database")
 
-        except Exception as e:
+        except Exception:
             conn.rollback()
-            logger.exception(f"Error saving to database: {e}")
+            logger.exception("Error saving to database.")
         finally:
             conn.close()
 
@@ -712,22 +714,22 @@ class ChessAnalyzer:
                         "total_move_count": self._create_tf_feature(total_move_count),
                         # Error counts
                         "black_blunders": self._create_tf_feature(
-                            self.normalize_by_max_move(black_blunders, total_move_count)
+                            self.normalize_by_max_move(black_blunders, total_move_count),
                         ),
                         "black_mistakes": self._create_tf_feature(
-                            self.normalize_by_max_move(black_mistakes, total_move_count)
+                            self.normalize_by_max_move(black_mistakes, total_move_count),
                         ),
                         "black_inaccuracies": self._create_tf_feature(
-                            self.normalize_by_max_move(black_inaccuracies, total_move_count)
+                            self.normalize_by_max_move(black_inaccuracies, total_move_count),
                         ),
                         "white_blunders": self._create_tf_feature(
-                            self.normalize_by_max_move(white_blunders, total_move_count)
+                            self.normalize_by_max_move(white_blunders, total_move_count),
                         ),
                         "white_mistakes": self._create_tf_feature(
-                            self.normalize_by_max_move(white_mistakes, total_move_count)
+                            self.normalize_by_max_move(white_mistakes, total_move_count),
                         ),
                         "white_inaccuracies": self._create_tf_feature(
-                            self.normalize_by_max_move(white_inaccuracies, total_move_count)
+                            self.normalize_by_max_move(white_inaccuracies, total_move_count),
                         ),
                     }
 
@@ -751,7 +753,7 @@ class ChessAnalyzer:
 
                         for move_data in move_features:
                             halfmove_count.append(
-                                self.normalize_by_max_move(move_data["halfmove_count"], total_move_count)
+                                self.normalize_by_max_move(move_data["halfmove_count"], total_move_count),
                             )
                             moves.extend(self.encode_move(move_data["move"]))
                             fens.extend(self.encode_fen(move_data["fen"]))
@@ -790,7 +792,7 @@ class ChessAnalyzer:
                                 "check_flags": self._create_int64_list_feature(check_flag),
                                 "mate_flags": self._create_int64_list_feature(mate_flag),
                                 "turn": self._create_int64_list_feature(turn),
-                            }
+                            },
                         )
 
                     with open("test.txt", "a") as file:
@@ -801,7 +803,7 @@ class ChessAnalyzer:
 
             logger.info(f"Successfully exported to {output_path}")
 
-        except Exception as e:
+        except Exception:
             logger.exception("Error exporting to TFRecord.")
 
     def run_analysis(
@@ -874,28 +876,36 @@ class ChessAnalyzer:
                         game_result = future.result()
                         results.append(game_result)
 
-                        # Log progress periodically
-                        if len(results) % 10 == 0:
-                            logger.info(f"Analyzed {len(results)}/{games_count} games in current batch")
                     except Exception:
                         game_id = future_to_game[future][0]  # First element is typically game_id
                         logger.exception(f"Game {game_id} generated an exception.")
 
+            clean_results = []
+            error_games = []
+            for game in results:
+                if "error" not in game:
+                    clean_results.append(game)
+                else:
+                    error_games.append(game)
+
+            logger.debug(f"Clean Games: {[game['game_id'] for game in clean_results]}")
+            logger.warning(f"Error Games: {[game['game_id'] for game in error_games]}")
+
             # Save results to database
             logger.info(f"Saving batch {batch_counter} results to database...")
-            self.save_to_database(results)
+            self.save_to_database(clean_results)
 
             # Export to TFRecord
-            tfrecord_path = os.path.join(tfrecord_dir, f"{game_type_filter}_batch_{batch_counter}.tfrecord")
+            tfrecord_path = os.path.join(tfrecord_dir, f"{game_type_filter}_batch_{last_game_id}.tfrecord")
             logger.info(f"Exporting batch {batch_counter} to TFRecord...")
-            self.export_to_tfrecord(results, tfrecord_path)
+            self.export_to_tfrecord(clean_results, tfrecord_path)
 
             if games:
                 last_game_id = games[-1][0]
                 logger.debug(f"Last Game ID: {last_game_id}")
 
             # Update counters
-            games_processed += games_count
+            games_processed += len(clean_results)
             batch_counter += 1
 
             logger.info(f"Completed batch {batch_counter - 1}. Total games processed: {games_processed}")
@@ -923,7 +933,8 @@ if __name__ == "__main__":
     )
 
     # Run analysis
-    analyzer.run_analysis(5000, total_games=100000, tfrecord_dir="data/tfrecords", resume_id=150554)
+    # NOTE: 150554 -> 184254 -> 217773 -> 250837 already processed.
+    analyzer.run_analysis(50000, total_games=15000, tfrecord_dir="data/tfrecords", resume_id=0)
     # analyzer.run_analysis(batch_size=50, total_games=100000)
 
     # Generate visualizations
