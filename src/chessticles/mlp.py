@@ -18,7 +18,7 @@ from sklearn.preprocessing import StandardScaler
 # Create output directories if they don't exist
 def create_directories():
     """Create necessary directories for saving models, plots, and metrics"""
-    dirs = ["models", "plots", "metrics"]
+    dirs = ["models", "plots", "metrics", "datasets"]  # Added datasets directory
     for dir_name in dirs:
         if not os.path.exists(dir_name):
             os.makedirs(dir_name)
@@ -180,7 +180,7 @@ def prepare_features_targets(df):
         "white_avg_time_per_move",
         "white_time_pressure_moves",
         "max_eval_advantage_white",
-        # "opponent_elo",  # Black's Elo (known for prediction)
+        "opponent_elo",  # Black's Elo (known for prediction)
     ]
 
     # Features specific to black player
@@ -193,15 +193,15 @@ def prepare_features_targets(df):
         "black_avg_time_per_move",
         "black_time_pressure_moves",
         "max_eval_advantage_black",
-        # "opponent_elo",  # White's Elo (known for prediction)
+        "opponent_elo",  # White's Elo (known for prediction)
     ]
 
     # Create opponent Elo columns
     df_white = df.copy()
     df_black = df.copy()
 
-    # df_white["opponent_elo"] = df_white["BlackElo"]
-    # df_black["opponent_elo"] = df_black["WhiteElo"]
+    df_white["opponent_elo"] = df_white["BlackElo"]
+    df_black["opponent_elo"] = df_black["WhiteElo"]
 
     # Encode categorical variables
     game_type_mapping = {gt: i for i, gt in enumerate(df["game_type"].unique())}
@@ -260,7 +260,7 @@ def train_evaluate_model(X, y, feature_names, player_color, model_type="mlp", gr
             "model__activation": ["identity", "relu", "tanh"],
             "model__alpha": [0.0001, 0.001, 0.01],
             "model__learning_rate": ["constant", "adaptive", "invscaling"],
-            "model__max_iter": [5000],
+            "model__max_iter": [10000],
         }
 
         grid = GridSearchCV(pipeline, param_grid, cv=5, scoring="neg_mean_squared_error", n_jobs=-1)
@@ -331,7 +331,26 @@ def train_evaluate_model(X, y, feature_names, player_color, model_type="mlp", gr
         json.dump(metrics, file, indent=4)
     print(f"Metrics saved to {metrics_filename}")
 
-    return model, X_test, y_test, y_pred_test, metrics
+    # Save test data and predictions for later visualization
+    datasets_filename = f"datasets/{player_color}_test_data_{timestamp}.pkl"
+    test_data = {
+        "X_test": X_test,
+        "y_test": y_test,
+        "y_pred": y_pred_test,
+        "feature_names": list(feature_names),
+        "timestamp": timestamp,
+    }
+    with open(datasets_filename, "wb") as file:
+        pickle.dump(test_data, file)
+    print(f"Test data and predictions saved to {datasets_filename}")
+
+    # Also save as CSV for easier access if needed
+    df_results = pd.DataFrame({"actual": y_test, "predicted": y_pred_test})
+    csv_filename = f"datasets/{player_color}_results_{timestamp}.csv"
+    df_results.to_csv(csv_filename, index=False)
+    print(f"Results saved to CSV: {csv_filename}")
+
+    return model, X_test, y_test, y_pred_test, metrics, datasets_filename
 
 
 def visualize_results(y_test, y_pred, player_color, timestamp):
@@ -470,7 +489,7 @@ def predict_elo(model, game_data, player_color="white"):
             game_data.get("white_avg_time_per_move", 0),
             game_data.get("white_time_pressure_moves", 0),
             game_data.get("max_eval_advantage_white", 0),
-            # game_data.get("opponent_elo", 0),  # Black's Elo
+            game_data.get("opponent_elo", 0),  # Black's Elo
         ]
     else:
         # Prepare features for black player prediction
@@ -488,7 +507,7 @@ def predict_elo(model, game_data, player_color="white"):
             game_data.get("black_avg_time_per_move", 0),
             game_data.get("black_time_pressure_moves", 0),
             game_data.get("max_eval_advantage_black", 0),
-            # game_data.get("opponent_elo", 0),  # White's Elo
+            game_data.get("opponent_elo", 0),  # White's Elo
         ]
 
     # Reshape for single prediction
@@ -513,6 +532,30 @@ def load_model(filename):
     with open(filename, "rb") as file:
         model = pickle.load(file)
     return model
+
+
+# Function to load saved test data and run visualization
+def visualize_from_saved_data(dataset_path):
+    """Load saved test data and generate visualizations.
+
+    Args:
+        dataset_path: Path to the saved test data pickle file
+
+    Returns:
+        Paths to generated visualization files
+    """
+    # Load test data
+    with open(dataset_path, "rb") as file:
+        test_data = pickle.load(file)
+
+    # Extract data
+    y_test = test_data["y_test"]
+    y_pred = test_data["y_pred"]
+    timestamp = test_data["timestamp"]
+    player_color = "White" if "white" in dataset_path.lower() else "Black"
+
+    # Generate visualizations
+    return visualize_results(y_test, y_pred, player_color, timestamp)
 
 
 # Main execution function
@@ -557,7 +600,7 @@ def main(db_path):
 
     # Train white model
     print("\nTraining and evaluating model for white players...")
-    white_model, X_test_white, y_test_white, y_pred_white, white_metrics = train_evaluate_model(
+    white_model, X_test_white, y_test_white, y_pred_white, white_metrics, white_dataset_file = train_evaluate_model(
         X_white,
         y_white,
         X_white.columns,
@@ -567,7 +610,7 @@ def main(db_path):
 
     # Train black model
     print("\nTraining and evaluating model for black players...")
-    black_model, X_test_black, y_test_black, y_pred_black, black_metrics = train_evaluate_model(
+    black_model, X_test_black, y_test_black, y_pred_black, black_metrics, black_dataset_file = train_evaluate_model(
         X_black,
         y_black,
         X_black.columns,
@@ -611,6 +654,8 @@ def main(db_path):
         "white_importance_plot": white_importance_plot,
         "black_importance_plot": black_importance_plot,
         "feature_metadata": f"metrics/feature_metadata_{timestamp}.json",
+        "white_dataset_file": white_dataset_file,
+        "black_dataset_file": black_dataset_file,
     }
 
     with open(f"metrics/run_summary_{timestamp}.json", "w") as file:
@@ -624,58 +669,71 @@ if __name__ == "__main__":
     # Replace with your actual database path
     db_path = "data/db.ocgdb.db3"
 
-    # Execute the pipeline
-    white_model, black_model, run_summary = main(db_path)
+    # Check if we should run the full training or just visualize from saved datasets
+    import sys
 
-    # Example of predicting Elo for a new game
-    print("\nExample: Predicting Elo for a new game...")
+    if len(sys.argv) > 1 and sys.argv[1] == "--visualize-only":
+        if len(sys.argv) > 2:
+            # Visualize from specified dataset file
+            dataset_path = sys.argv[2]
+            print(f"Visualizing from saved dataset: {dataset_path}")
+            plot_files = visualize_from_saved_data(dataset_path)
+            print(f"Generated visualization files: {plot_files}")
+        else:
+            print("Please provide the path to the saved dataset file.")
+    else:
+        # Execute the full pipeline
+        white_model, black_model, run_summary = main(db_path)
 
-    # Sample game data (you would extract this from a real game)
-    new_game = {
-        "white_acl": 120.5,
-        "black_acl": 118.2,
-        "white_blunders": 3,
-        "white_mistakes": 5,
-        "white_inaccuracies": 7,
-        "black_blunders": 4,
-        "black_mistakes": 6,
-        "black_inaccuracies": 8,
-        "position_complexity": 45.3,
-        "white_time_usage": 250.5,
-        "black_time_usage": 275.2,
-        "white_eval_volatility": 120.7,
-        "black_eval_volatility": 135.2,
-        "white_avg_time_per_move": 12.5,
-        "black_avg_time_per_move": 13.8,
-        "white_time_pressure_moves": 5,
-        "black_time_pressure_moves": 6,
-        "max_eval_advantage_white": 250,
-        "max_eval_advantage_black": 150,
-        "game_type_encoded": 1,  # Rapid
-        "estimated_time": 600,
-        "opponent_elo": 1800,  # Known Elo of opponent
-    }
+        # Example of predicting Elo for a new game
+        print("\nExample: Predicting Elo for a new game...")
 
-    # Predict for white player
-    white_predicted_elo = predict_elo(white_model, new_game, "white")
-    print(f"Predicted White Elo: {white_predicted_elo:.0f}")
+        # Sample game data (you would extract this from a real game)
+        new_game = {
+            "white_acl": 120.5,
+            "black_acl": 118.2,
+            "white_blunders": 3,
+            "white_mistakes": 5,
+            "white_inaccuracies": 7,
+            "black_blunders": 4,
+            "black_mistakes": 6,
+            "black_inaccuracies": 8,
+            "position_complexity": 45.3,
+            "white_time_usage": 250.5,
+            "black_time_usage": 275.2,
+            "white_eval_volatility": 120.7,
+            "black_eval_volatility": 135.2,
+            "white_avg_time_per_move": 12.5,
+            "black_avg_time_per_move": 13.8,
+            "white_time_pressure_moves": 5,
+            "black_time_pressure_moves": 6,
+            "max_eval_advantage_white": 250,
+            "max_eval_advantage_black": 150,
+            "game_type_encoded": 1,  # Rapid
+            "estimated_time": 600,
+            "opponent_elo": 1800,  # Known Elo of opponent
+        }
 
-    # Update opponent Elo for black player prediction
-    # new_game["opponent_elo"] = white_predicted_elo
+        # Predict for white player
+        white_predicted_elo = predict_elo(white_model, new_game, "white")
+        print(f"Predicted White Elo: {white_predicted_elo:.0f}")
 
-    # Predict for black player
-    black_predicted_elo = predict_elo(black_model, new_game, "black")
-    print(f"Predicted Black Elo: {black_predicted_elo:.0f}")
+        # Update opponent Elo for black player prediction
+        # new_game["opponent_elo"] = white_predicted_elo
 
-    timestamp = (datetime.now().strftime("%Y%m%d_%H%M%S"),)
-    # Save prediction example
-    prediction_example = {
-        "timestamp": timestamp,
-        "game_data": new_game,
-        "white_predicted_elo": float(white_predicted_elo),
-        "black_predicted_elo": float(black_predicted_elo),
-    }
+        # Predict for black player
+        black_predicted_elo = predict_elo(black_model, new_game, "black")
+        print(f"Predicted Black Elo: {black_predicted_elo:.0f}")
 
-    with open(f"metrics/prediction_example_{timestamp}.json", "w") as file:
-        json.dump(prediction_example, file, indent=4)
-    print(f"Prediction example saved to metrics/prediction_example_{timestamp}.json")
+        curr_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Save prediction example
+        prediction_example = {
+            "timestamp": curr_timestamp,
+            "game_data": new_game,
+            "white_predicted_elo": float(white_predicted_elo),
+            "black_predicted_elo": float(black_predicted_elo),
+        }
+
+        with open(f"metrics/prediction_example_{curr_timestamp}.json", "w") as file:
+            json.dump(prediction_example, file, indent=4)
+        print(f"Prediction example saved to metrics/prediction_example_{curr_timestamp}.json")
