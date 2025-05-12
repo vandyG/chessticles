@@ -1,0 +1,15 @@
+Feature,Importance
+opponent_elo,0.11996676173580992
+max_eval_advantage_black,0.10645012352161853
+black_time_pressure_moves,0.10507576449693358
+black_blunders,0.08823936782016376
+estimated_time,0.08236773662487534
+black_mistakes,0.08037318805641086
+black_time_usage,0.06717630617378245
+white_acl,0.06701042391346389
+black_acl,0.06504943010220443
+black_inaccuracies,0.06309746972964589
+black_eval_volatility,0.06182950093920947
+position_complexity,0.04757352146594756
+black_avg_time_per_move,0.04579040541993421
+game_type_encoded,1.3137287e-316

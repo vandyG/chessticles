@@ -1,0 +1,96 @@
+{
+    "run_timestamp": "20250423_125259",
+    "white_model": "models/white_model_20250423_125259.pkl",
+    "black_model": "models/black_model_20250423_125259.pkl",
+    "white_metrics": {
+        "model_version": "white_20250423_125307",
+        "player_color": "white",
+        "feature_names": [
+            "white_acl",
+            "black_acl",
+            "position_complexity",
+            "game_type_encoded",
+            "estimated_time",
+            "white_blunders",
+            "white_mistakes",
+            "white_inaccuracies",
+            "white_time_usage",
+            "white_eval_volatility",
+            "white_avg_time_per_move",
+            "white_time_pressure_moves",
+            "max_eval_advantage_white"
+        ],
+        "training_size": 7925,
+        "testing_size": 1982,
+        "timestamp": "20250423_125307",
+        "best_parameters": {
+            "model__activation": "relu",
+            "model__alpha": 0.01,
+            "model__hidden_layer_sizes": [
+                50
+            ],
+            "model__learning_rate": "constant",
+            "model__max_iter": 10000
+        },
+        "train_mse": 93342.77135515488,
+        "test_mse": 98565.67634565204,
+        "train_mae": 244.88002640110335,
+        "test_mae": 252.15099240569816,
+        "train_r2": 0.3249265912666872,
+        "test_r2": 0.2927934318475143,
+        "train_rmse": 305.5204925289871,
+        "test_rmse": 313.95171021297534
+    },
+    "black_metrics": {
+        "model_version": "black_20250423_132749",
+        "player_color": "black",
+        "feature_names": [
+            "white_acl",
+            "black_acl",
+            "position_complexity",
+            "game_type_encoded",
+            "estimated_time",
+            "black_blunders",
+            "black_mistakes",
+            "black_inaccuracies",
+            "black_time_usage",
+            "black_eval_volatility",
+            "black_avg_time_per_move",
+            "black_time_pressure_moves",
+            "max_eval_advantage_black"
+        ],
+        "training_size": 7925,
+        "testing_size": 1982,
+        "timestamp": "20250423_132749",
+        "best_parameters": {
+            "model__activation": "relu",
+            "model__alpha": 0.01,
+            "model__hidden_layer_sizes": [
+                100
+            ],
+            "model__learning_rate": "constant",
+            "model__max_iter": 10000
+        },
+        "train_mse": 90858.02522858999,
+        "test_mse": 100499.33307039487,
+        "train_mae": 241.69722876867465,
+        "test_mae": 255.961280305164,
+        "train_r2": 0.3386567230287456,
+        "test_r2": 0.30268530085074075,
+        "train_rmse": 301.4266498314142,
+        "test_rmse": 317.0162977993322
+    },
+    "white_plots": [
+        "plots/White_actual_vs_predicted_20250423_125259.png",
+        "plots/White_error_distribution_20250423_125259.png"
+    ],
+    "black_plots": [
+        "plots/Black_actual_vs_predicted_20250423_125259.png",
+        "plots/Black_error_distribution_20250423_125259.png"
+    ],
+    "white_importance_plot": "plots/White_feature_importance_20250423_125259.png",
+    "black_importance_plot": "plots/Black_feature_importance_20250423_125259.png",
+    "feature_metadata": "metrics/feature_metadata_20250423_125259.json",
+    "white_dataset_file": "datasets/white_test_data_20250423_125307.pkl",
+    "black_dataset_file": "datasets/black_test_data_20250423_132749.pkl"
+}
