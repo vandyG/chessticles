@@ -355,52 +355,60 @@ def train_evaluate_model(X, y, feature_names, player_color, model_type="mlp", gr
 
 def visualize_results(y_test, y_pred, player_color, timestamp):
     """Visualize model predictions against actual Elo ratings.
-
     Args:
         y_test: Actual Elo ratings
         y_pred: Predicted Elo ratings
         player_color: 'White' or 'Black' to indicate which player's model
         timestamp: Timestamp for file naming
     """
+    # Set figure aesthetics
     plt.figure(figsize=(10, 6))
+    plt.rcParams["axes.edgecolor"] = "#816353"
+    plt.rcParams["axes.labelcolor"] = "#816353"
+    plt.rcParams["xtick.color"] = "#816353"
+    plt.rcParams["ytick.color"] = "#816353"
 
     # Scatter plot of actual vs predicted values
-    plt.scatter(y_test, y_pred, alpha=0.5)
+    plt.scatter(y_test, y_pred, alpha=0.5, color="#523e32")
 
     # Plot the perfect prediction line
     min_val = min(y_test.min(), y_pred.min())
     max_val = max(y_test.max(), y_pred.max())
-    plt.plot([min_val, max_val], [min_val, max_val], "r--")
+    plt.plot([min_val, max_val], [min_val, max_val], linestyle="--", color="#523e32")
 
     plt.xlabel("Actual Elo Rating")
     plt.ylabel("Predicted Elo Rating")
     plt.title(f"{player_color} Player Elo: Actual vs Predicted")
-    plt.grid(True)
-
+    plt.grid(False)  # Remove gridlines
     plt.tight_layout()
 
     # Save the plot
-    plot_filename = f"plots/{player_color}_actual_vs_predicted_{timestamp}.png"
-    plt.savefig(plot_filename, dpi=300)
+    plot_filename = f"plots/{player_color}_actual_vs_predicted_{timestamp}.svg"
+    plt.savefig(plot_filename, dpi=300, transparent=True)
     plt.close()
     print(f"Plot saved to {plot_filename}")
 
     # Error distribution plot
     errors = y_pred - y_test
-
     plt.figure(figsize=(10, 6))
-    sns.histplot(errors, kde=True)
+    plt.rcParams["axes.edgecolor"] = "#816353"
+    plt.rcParams["axes.labelcolor"] = "#816353"
+    plt.rcParams["xtick.color"] = "#816353"
+    plt.rcParams["ytick.color"] = "#816353"
+
+    # Create histogram without KDE to avoid legend
+    plt.hist(errors, bins=30, color="#523e32", alpha=0.7, edgecolor="#523e32")
+
     plt.xlabel("Prediction Error")
     plt.ylabel("Frequency")
     plt.title(f"Distribution of Prediction Errors ({player_color} Player)")
-    plt.axvline(x=0, color="r", linestyle="--")
-    plt.grid(True)
-
+    plt.axvline(x=0, color="#523e32", linestyle="--")
+    plt.grid(False)  # Remove gridlines
     plt.tight_layout()
 
     # Save the error distribution plot
-    error_plot_filename = f"plots/{player_color}_error_distribution_{timestamp}.png"
-    plt.savefig(error_plot_filename, dpi=300)
+    error_plot_filename = f"plots/{player_color}_error_distribution_{timestamp}.svg"
+    plt.savefig(error_plot_filename, dpi=300, transparent=True)
     plt.close()
     print(f"Error distribution plot saved to {error_plot_filename}")
 
