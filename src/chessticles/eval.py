@@ -934,7 +934,7 @@ if __name__ == "__main__":
 
     # Run analysis
     # NOTE: 150554 -> 184254 -> 217773 -> 250837 already processed.
-    analyzer.run_analysis(50000, total_games=15000, tfrecord_dir="data/tfrecords", resume_id=0)
+    analyzer.run_analysis(5000, total_games=20000, tfrecord_dir="data/tfrecords", resume_id=140673)
     # analyzer.run_analysis(batch_size=50, total_games=100000)
 
     # Generate visualizations
